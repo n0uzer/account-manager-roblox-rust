@@ -1,0 +1,94 @@
+//! Background worker: every network call happens on one dedicated thread, so
+//! the UI never freezes while a ticket or an avatar is being fetched.
+
+use std::sync::mpsc::{channel, Receiver, Sender};
+
+use crate::avatar::{self, AvatarImage};
+use crate::roblox::{self, LaunchKind, Profile};
+
+pub enum Job {
+    Validate {
+        id: String,
+        cookie: String,
+    },
+    Launch {
+        label: String,
+        place_id: u64,
+        cookie: String,
+        multi: bool,
+    },
+    Avatar {
+        user_id: u64,
+    },
+}
+
+pub enum Done {
+    Validated {
+        id: String,
+        result: Result<Profile, String>,
+    },
+    Launched {
+        label: String,
+        result: Result<LaunchKind, String>,
+    },
+    Avatar {
+        user_id: u64,
+        result: Result<AvatarImage, String>,
+    },
+}
+
+pub struct Worker {
+    jobs: Sender<Job>,
+    results: Receiver<Done>,
+}
+
+impl Worker {
+    /// Spawn the worker thread. Jobs are handled strictly one by one.
+    pub fn spawn() -> Self {
+        let (job_tx, job_rx) = channel::<Job>();
+        let (done_tx, done_rx) = channel::<Done>();
+
+        let _ = std::thread::Builder::new()
+            .name("rbm-worker".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let done = match job {
+                        Job::Validate { id, cookie } => Done::Validated {
+                            id,
+                            result: roblox::fetch_identity(&cookie),
+                        },
+                        Job::Launch {
+                            label,
+                            place_id,
+                            cookie,
+                            multi,
+                        } => Done::Launched {
+                            label,
+                            result: roblox::launch_game(place_id, &cookie, multi),
+                        },
+                        Job::Avatar { user_id } => Done::Avatar {
+                            user_id,
+                            result: avatar::load(user_id),
+                        },
+                    };
+
+                    if done_tx.send(done).is_err() {
+                        break;
+                    }
+                }
+            });
+
+        Worker {
+            jobs: job_tx,
+            results: done_rx,
+        }
+    }
+
+    pub fn send(&self, job: Job) {
+        let _ = self.jobs.send(job);
+    }
+
+    pub fn try_recv(&self) -> Option<Done> {
+        self.results.try_recv().ok()
+    }
+}

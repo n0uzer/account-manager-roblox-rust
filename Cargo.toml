@@ -17,6 +17,8 @@ rand = "0.8"
 open = "5"
 arboard = "3"
 urlencoding = "2"
+zeroize = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = "z"

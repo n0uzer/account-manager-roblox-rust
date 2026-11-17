@@ -6,7 +6,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod avatar;
+mod config;
 mod crypto;
+mod dpapi;
+mod jobs;
 mod roblox;
 mod store;
 mod ui;

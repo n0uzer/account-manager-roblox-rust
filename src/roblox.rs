@@ -10,7 +10,7 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-const USER_AGENT: &str = "RbxAccountManager/1.0 (local open-source tool)";
+pub const USER_AGENT: &str = "RbxAccountManager/1.0 (local open-source tool)";
 const ME_URL: &str = "https://users.roblox.com/v1/users/authenticated";
 const TICKET_URL: &str = "https://auth.roblox.com/v1/authentication-ticket/";
 const PLACE_LAUNCHER: &str = "https://assetgame.roblox.com/game/PlaceLauncher.ashx";
@@ -58,7 +58,11 @@ pub fn clean_cookie(raw: &str) -> String {
     if value.to_ascii_lowercase().starts_with(".roblosecurity=") {
         value = &value[".roblosecurity=".len()..];
     }
-    value.trim().trim_matches('"').trim_matches('\'').to_string()
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
 }
 
 /// Validate the cookie and return the account profile.
@@ -88,9 +92,7 @@ pub fn fetch_identity(raw_cookie: &str) -> Result<Profile, String> {
                 display: identity.display_name,
             })
         }
-        Err(ureq::Error::Status(401 | 403, _)) => {
-            Err("Cookie недействителен или истёк".into())
-        }
+        Err(ureq::Error::Status(401 | 403, _)) => Err("Cookie недействителен или истёк".into()),
         Err(ureq::Error::Status(code, _)) => Err(format!("Roblox API: HTTP {code}")),
         Err(err) => Err(format!("Нет связи с Roblox: {err}")),
     }
@@ -124,7 +126,7 @@ pub fn fetch_ticket(raw_cookie: &str) -> Result<String, String> {
                 }
                 None => return Err("Cookie недействителен (нет CSRF-токена)".into()),
             },
-            Err(ureq::Error::Status(401 | 403, _)) => {
+            Err(ureq::Error::Status(401, _)) => {
                 return Err("Cookie недействителен (тикет не выдан)".into())
             }
             Err(ureq::Error::Status(code, _)) => {
@@ -195,9 +197,11 @@ pub fn find_client() -> Option<PathBuf> {
         }
     }
 
-    candidates
-        .into_iter()
-        .max_by_key(|path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok())
+    candidates.into_iter().max_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    })
 }
 
 /// Read the path from `HKCU\Software\Classes\roblox-player\shell\open\command`.
