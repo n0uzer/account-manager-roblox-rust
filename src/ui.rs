@@ -21,6 +21,16 @@ const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(180, 40, 40);
 const OK_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 110, 40);
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(140, 80, 0);
 const AUTO_LOCK_CHOICES: [u32; 5] = [0, 1, 5, 15, 30];
+const FPS_CHOICES: [u32; 5] = [0, 30, 60, 120, 144];
+const QUALITY_CHOICES: [u32; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+const SIZE_CHOICES: [(u32, u32); 6] = [
+    (0, 0),
+    (1280, 720),
+    (1024, 576),
+    (960, 540),
+    (800, 450),
+    (640, 360),
+];
 
 struct Form {
     editing: Option<String>,
@@ -345,6 +355,98 @@ impl App {
                 if ui.button("Импорт…").clicked() {
                     self.open_transfer(TransferKind::Import);
                 }
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("FPS:");
+                egui::ComboBox::from_id_salt("fps-cap")
+                    .selected_text(match self.config.fps_cap {
+                        0 => "без лимита".to_string(),
+                        fps => format!("{fps}"),
+                    })
+                    .show_ui(ui, |ui| {
+                        for option in FPS_CHOICES {
+                            let text = if option == 0 {
+                                "без лимита".to_string()
+                            } else {
+                                format!("{option} FPS")
+                            };
+                            if ui
+                                .selectable_label(self.config.fps_cap == option, text)
+                                .clicked()
+                            {
+                                self.config.fps_cap = option;
+                                self.save_config();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Потолок кадров клиента (DFIntTaskSchedulerTargetFps). \
+                         Применяется при следующем запуске окна.",
+                    );
+
+                ui.label("Графика:");
+                egui::ComboBox::from_id_salt("graphics-quality")
+                    .selected_text(match self.config.graphics_quality {
+                        0 => "по умолчанию".to_string(),
+                        level => format!("уровень {level}"),
+                    })
+                    .show_ui(ui, |ui| {
+                        for option in QUALITY_CHOICES {
+                            let text = if option == 0 {
+                                "по умолчанию".to_string()
+                            } else {
+                                format!("уровень {option}")
+                            };
+                            if ui
+                                .selectable_label(self.config.graphics_quality == option, text)
+                                .clicked()
+                            {
+                                self.config.graphics_quality = option;
+                                self.save_config();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "1 — самый низкий, 10 — максимальный (DFIntDebugFRMQualityLevelOverride). \
+                         Меньше качество — меньше нагрузки на видеокарту.",
+                    );
+
+                ui.label("Разрешение окна:");
+                egui::ComboBox::from_id_salt("window-size")
+                    .selected_text(if self.config.window_width == 0 {
+                        "как обычно".to_string()
+                    } else {
+                        format!("{}×{}", self.config.window_width, self.config.window_height)
+                    })
+                    .show_ui(ui, |ui| {
+                        for (width, height) in SIZE_CHOICES {
+                            let text = if width == 0 {
+                                "как обычно".to_string()
+                            } else {
+                                format!("{width}×{height}")
+                            };
+                            let picked = self.config.window_width == width
+                                && self.config.window_height == height;
+                            if ui.selectable_label(picked, text).clicked() {
+                                self.config.window_width = width;
+                                self.config.window_height = height;
+                                self.save_config();
+                            }
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "Меньшее окно = меньше пикселей на кадр. Работает только при \
+                         включённом режиме «Несколько окон (--app)»: deeplink размер окна \
+                         не задаёт.",
+                    );
+
+                ui.separator();
+                ui.small("FPS и графика пишутся в ClientAppSettings.json клиента.");
             });
 
             ui.add_space(4.0);
@@ -889,8 +991,19 @@ impl App {
             place_id,
             cookie: account.cookie,
             multi: self.config.multi_instance,
+            limits: self.limits(),
         });
         self.status = format!("Запускаю {}…", account.label);
+    }
+
+    /// Snapshot of the FPS/quality/window-size limits from the toolbar.
+    fn limits(&self) -> roblox::Limits {
+        roblox::Limits {
+            fps_cap: self.config.fps_cap,
+            quality: self.config.graphics_quality,
+            width: self.config.window_width,
+            height: self.config.window_height,
+        }
     }
 
     /// Toggle an account in the batch launch list.
@@ -955,6 +1068,7 @@ impl App {
                     place_id,
                     cookie: account.cookie,
                     multi: self.config.multi_instance,
+                    limits: self.limits(),
                 });
                 self.status = format!(
                     "Запускаю {}… (в очереди: {})",
@@ -1084,7 +1198,7 @@ impl App {
                 Done::Launched { label, result } => {
                     self.pending = self.pending.saturating_sub(1);
                     self.status = match result {
-                        Ok(kind) => format!("{label}: запущен ({})", kind.human()),
+                        Ok(outcome) => format!("{label}: запущен ({})", outcome.summary()),
                         Err(err) => format!("{label}: {err}"),
                     };
                 }

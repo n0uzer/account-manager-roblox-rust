@@ -4,7 +4,7 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::avatar::{self, AvatarImage};
-use crate::roblox::{self, LaunchKind, Profile};
+use crate::roblox::{self, LaunchOutcome, Limits, Profile};
 
 pub enum Job {
     Validate {
@@ -16,6 +16,7 @@ pub enum Job {
         place_id: u64,
         cookie: String,
         multi: bool,
+        limits: Limits,
     },
     Avatar {
         user_id: u64,
@@ -29,7 +30,7 @@ pub enum Done {
     },
     Launched {
         label: String,
-        result: Result<LaunchKind, String>,
+        result: Result<LaunchOutcome, String>,
     },
     Avatar {
         user_id: u64,
@@ -62,9 +63,10 @@ impl Worker {
                             place_id,
                             cookie,
                             multi,
+                            limits,
                         } => Done::Launched {
                             label,
-                            result: roblox::launch_game(place_id, &cookie, multi),
+                            result: roblox::launch_game(place_id, &cookie, multi, limits),
                         },
                         Job::Avatar { user_id } => Done::Avatar {
                             user_id,

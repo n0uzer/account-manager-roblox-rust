@@ -37,6 +37,13 @@ pub struct Config {
     /// 0 disables the auto-lock.
     pub auto_lock_minutes: u32,
     pub sort: SortKey,
+    /// Target FPS for the client, 0 keeps the game default.
+    pub fps_cap: u32,
+    /// Graphics quality 1..=10, 0 keeps the game default.
+    pub graphics_quality: u32,
+    /// Client area size in `--app` mode, 0x0 keeps the default window.
+    pub window_width: u32,
+    pub window_height: u32,
 }
 
 impl Default for Config {
@@ -46,6 +53,11 @@ impl Default for Config {
             multi_instance: true,
             auto_lock_minutes: 15,
             sort: SortKey::Added,
+            // 60 FPS is the sane default: Roblox renders at that rate anyway.
+            fps_cap: 60,
+            graphics_quality: 0,
+            window_width: 0,
+            window_height: 0,
         }
     }
 }

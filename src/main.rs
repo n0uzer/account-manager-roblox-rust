@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod avatar;
+mod client_settings;
 mod config;
 mod crypto;
 mod dpapi;
@@ -14,12 +15,13 @@ mod jobs;
 mod roblox;
 mod store;
 mod ui;
+mod window;
 
 fn main() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 580.0])
-            .with_min_inner_size([760.0, 460.0])
+            .with_inner_size([900.0, 640.0])
+            .with_min_inner_size([760.0, 520.0])
             .with_title("RbxAccountManager"),
         ..Default::default()
     };

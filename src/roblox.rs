@@ -10,6 +10,9 @@ use std::process::Command;
 
 use serde::Deserialize;
 
+use crate::client_settings;
+use crate::window;
+
 pub const USER_AGENT: &str = "RbxAccountManager/1.0 (local open-source tool)";
 const ME_URL: &str = "https://users.roblox.com/v1/users/authenticated";
 const TICKET_URL: &str = "https://auth.roblox.com/v1/authentication-ticket/";
@@ -30,6 +33,59 @@ impl LaunchKind {
         match self {
             LaunchKind::Deeplink => "через deeplink",
             LaunchKind::NewWindow => "отдельное окно (--app)",
+        }
+    }
+}
+
+/// Optional per-launch limits that save RAM and CPU.
+///
+/// A zero value always means "keep the game default".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// Target FPS via `DFIntTaskSchedulerTargetFps`.
+    pub fps_cap: u32,
+    /// Graphics quality 1..=10 via `DFIntDebugFRMQualityLevelOverride`.
+    pub quality: u32,
+    /// Client area width, applied only in `--app` mode.
+    pub width: u32,
+    /// Client area height, applied only in `--app` mode.
+    pub height: u32,
+}
+
+impl Limits {
+    fn has_settings(self) -> bool {
+        self.fps_cap > 0 || self.quality > 0
+    }
+
+    fn has_size(self) -> bool {
+        self.width > 0 && self.height > 0
+    }
+
+    /// Human-readable list of what was written into the client settings.
+    fn settings_note(self) -> String {
+        let mut parts = Vec::new();
+        if self.fps_cap > 0 {
+            parts.push(format!("FPS ≤ {}", self.fps_cap));
+        }
+        if self.quality > 0 {
+            parts.push(format!("графика {}", self.quality));
+        }
+        parts.join(", ")
+    }
+}
+
+/// What actually happened, plus notes worth showing in the status bar.
+pub struct LaunchOutcome {
+    pub kind: LaunchKind,
+    pub notes: Vec<String>,
+}
+
+impl LaunchOutcome {
+    pub fn summary(&self) -> String {
+        if self.notes.is_empty() {
+            self.kind.human().to_string()
+        } else {
+            format!("{}, {}", self.kind.human(), self.notes.join(", "))
         }
     }
 }
@@ -238,7 +294,11 @@ fn run_hidden(command: &mut Command) -> Option<Vec<u8>> {
 /// `RobloxPlayerBeta.exe --app -t <ticket> -j <join url>`.
 ///
 /// `--app` skips the singleton check, so every call opens another window.
-fn spawn_new_window(exe: &Path, ticket: &str, join_url: &str) -> Result<(), String> {
+fn spawn_new_window(
+    exe: &Path,
+    ticket: &str,
+    join_url: &str,
+) -> Result<std::process::Child, String> {
     Command::new(exe)
         .arg("--app")
         .arg("-t")
@@ -246,7 +306,6 @@ fn spawn_new_window(exe: &Path, ticket: &str, join_url: &str) -> Result<(), Stri
         .arg("-j")
         .arg(join_url)
         .spawn()
-        .map(|_child| ())
         .map_err(|err| format!("Не удалось запустить {}: {err}", exe.display()))
 }
 
@@ -254,18 +313,57 @@ fn spawn_new_window(exe: &Path, ticket: &str, join_url: &str) -> Result<(), Stri
 ///
 /// * `multi == false` — system `roblox-player:` handler, single window.
 /// * `multi == true`  — direct client start with `--app`, new window every call.
-pub fn launch_game(place_id: u64, cookie: &str, multi: bool) -> Result<LaunchKind, String> {
+///
+/// FPS and quality limits are written into `ClientSettings/ClientAppSettings.json`
+/// inside the client version folder before the client starts, because the client
+/// reads that file only at startup. The window size is applied afterwards, which
+/// is possible only for windows we spawned ourselves.
+pub fn launch_game(
+    place_id: u64,
+    cookie: &str,
+    multi: bool,
+    limits: Limits,
+) -> Result<LaunchOutcome, String> {
     let ticket = fetch_ticket(cookie)?;
+    let client = find_client();
+    let mut notes = Vec::new();
+
+    if limits.has_settings() {
+        match client.as_deref() {
+            Some(exe) => match client_settings::apply(exe, limits.fps_cap, limits.quality) {
+                Ok(Some(_)) => notes.push(limits.settings_note()),
+                Ok(None) => {}
+                Err(err) => notes.push(format!("настройки клиента не применены: {err}")),
+            },
+            None => notes.push("клиент не найден: FPS/графику не применил".into()),
+        }
+    }
 
     if multi {
-        let exe = find_client()
-            .ok_or_else(|| format!("Не нашёл {CLIENT_EXE}. Клиент Roblox установлен?"))?;
+        let exe =
+            client.ok_or_else(|| format!("Не нашёл {CLIENT_EXE}. Клиент Roblox установлен?"))?;
         let join_url = build_join_url(place_id, random_tracker());
-        spawn_new_window(&exe, &ticket, &join_url)?;
-        return Ok(LaunchKind::NewWindow);
+        let child = spawn_new_window(&exe, &ticket, &join_url)?;
+
+        if limits.has_size() {
+            window::resize_when_ready(child.id(), limits.width, limits.height);
+            notes.push(format!("окно {}×{}", limits.width, limits.height));
+        }
+
+        return Ok(LaunchOutcome {
+            kind: LaunchKind::NewWindow,
+            notes,
+        });
+    }
+
+    if limits.has_size() {
+        notes.push("размер окна задаётся только в режиме нескольких окон".into());
     }
 
     let uri = build_launch_uri(place_id, &ticket);
     open::that(uri).map_err(|err| format!("Не удалось открыть клиент Roblox: {err}"))?;
-    Ok(LaunchKind::Deeplink)
+    Ok(LaunchOutcome {
+        kind: LaunchKind::Deeplink,
+        notes,
+    })
 }
