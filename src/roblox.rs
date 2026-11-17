@@ -209,12 +209,14 @@ fn ticket_for_shape(cookie: &str, body: &str, content_type: &str) -> Result<Stri
 
         match request.send_string(body) {
             Ok(response) => {
-                return response
+                let ticket = response
                     .header("rbx-authentication-ticket")
-                    .map(str::to_string)
-                    .ok_or_else(|| {
-                        TicketFailure::Fatal("Roblox не выдал authentication ticket".into())
-                    });
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+                return ticket.ok_or_else(|| {
+                    TicketFailure::Fatal("Roblox не выдал authentication ticket".into())
+                });
             }
             Err(ureq::Error::Status(403, response)) => {
                 let token = response.header("x-csrf-token").map(str::to_string);
@@ -279,15 +281,12 @@ fn summarize(body: &str) -> String {
 pub fn build_launch_uri(place_id: u64, ticket: &str) -> String {
     let tracker = random_tracker();
     let launcher = build_join_url(place_id, tracker);
-    let launched_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_millis())
-        .unwrap_or(0);
+    let launched_at = now_millis();
 
     format!(
         "roblox-player:1+launchmode:play+gameinfo:{ticket}+launchtime:{launched_at}\
          +placelauncherurl:{}+browsertrackerid:{tracker}\
-         +robloxLocale:en_us+gameLocale:en_us+channel:+",
+         +robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp",
         urlencoding::encode(&launcher)
     )
 }
@@ -370,8 +369,36 @@ fn run_hidden(command: &mut Command) -> Option<Vec<u8>> {
     output.status.success().then_some(output.stdout)
 }
 
+/// Endpoint the client redeems the authentication ticket at.
+const NEGOTIATE_URL: &str = "https://www.roblox.com/Login/Negotiate.ashx";
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Arguments for one standalone client window.
+///
+/// `-a` is what makes `-t` work: without it the client never learns where to
+/// redeem the ticket, ignores it and opens the login screen instead.
+fn window_args(ticket: &str, join_url: &str, launchtime: i64) -> Vec<String> {
+    [
+        "--app".to_string(),
+        "-a".to_string(),
+        NEGOTIATE_URL.to_string(),
+        "-t".to_string(),
+        ticket.to_string(),
+        format!("--launchtime={launchtime}"),
+        "-j".to_string(),
+        join_url.to_string(),
+    ]
+    .to_vec()
+}
+
 /// Start a separate client window:
-/// `RobloxPlayerBeta.exe --app -t <ticket> -j <join url>`.
+/// `RobloxPlayerBeta.exe --app -a <negotiate> -t <ticket> --launchtime=<ms> -j <url>`.
 ///
 /// `--app` skips the singleton check, so every call opens another window.
 fn spawn_new_window(
@@ -380,11 +407,7 @@ fn spawn_new_window(
     join_url: &str,
 ) -> Result<std::process::Child, String> {
     Command::new(exe)
-        .arg("--app")
-        .arg("-t")
-        .arg(ticket)
-        .arg("-j")
-        .arg(join_url)
+        .args(window_args(ticket, join_url, now_millis()))
         .spawn()
         .map_err(|err| format!("Не удалось запустить {}: {err}", exe.display()))
 }
@@ -489,5 +512,34 @@ mod tests {
         assert!(limits.has_settings());
         assert!(limits.has_size());
         assert_eq!(limits.settings_note(), "FPS ≤ 60, графика 1");
+    }
+
+    #[test]
+    fn window_args_include_the_negotiate_endpoint() {
+        // Without `-a` the client ignores `-t` and shows the login screen.
+        let args = window_args("TICKET", "https://example/join", 1700000000000);
+        assert_eq!(
+            args,
+            [
+                "--app",
+                "-a",
+                "https://www.roblox.com/Login/Negotiate.ashx",
+                "-t",
+                "TICKET",
+                "--launchtime=1700000000000",
+                "-j",
+                "https://example/join",
+            ]
+        );
+    }
+
+    #[test]
+    fn join_url_carries_place_and_tracker() {
+        let url = build_join_url(1818, 1234);
+        assert!(url.starts_with("https://assetgame.roblox.com/game/PlaceLauncher.ashx?"));
+        assert!(url.contains("request=RequestGame"));
+        assert!(url.contains("placeId=1818"));
+        assert!(url.contains("browserTrackerId=1234"));
+        assert!(url.contains("isPlayTogetherGame=false"));
     }
 }
