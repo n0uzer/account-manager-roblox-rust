@@ -154,22 +154,51 @@ pub fn fetch_identity(raw_cookie: &str) -> Result<Profile, String> {
     }
 }
 
+/// Body / content type pairs the ticket endpoint accepts. Roblox is picky
+/// about the media type of the CSRF request: a request without one is answered
+/// with `415`, so the shapes are tried in order until one is accepted.
+const TICKET_SHAPES: [(&str, &str); 2] = [
+    ("{}", "application/json"),
+    ("", "application/x-www-form-urlencoded"),
+];
+
+/// Why a single attempt failed.
+enum TicketFailure {
+    /// The request shape was rejected, another media type may work.
+    TryAnother(String),
+    /// Retrying with another shape will not help.
+    Fatal(String),
+}
+
 /// Exchange the cookie for an authentication ticket.
 ///
-/// Flow: an empty POST first returns `403` plus an `x-csrf-token` header, then
-/// the same POST with that token returns the ticket. The empty request must not
-/// carry `Content-Type` nor an empty `X-CSRF-TOKEN`: Roblox rejects such a
-/// request with a `403` that has no CSRF header, which looks like a dead cookie.
+/// Flow: the first POST is answered with `403` plus an `x-csrf-token` header,
+/// then the same POST with that token returns `rbx-authentication-ticket`.
 pub fn fetch_ticket(raw_cookie: &str) -> Result<String, String> {
     let cookie = clean_cookie(raw_cookie);
     if cookie.is_empty() {
         return Err("Пустой cookie".into());
     }
+
+    let mut rejection = String::new();
+    for (body, content_type) in TICKET_SHAPES {
+        match ticket_for_shape(&cookie, body, content_type) {
+            Ok(ticket) => return Ok(ticket),
+            Err(TicketFailure::Fatal(message)) => return Err(message),
+            Err(TicketFailure::TryAnother(message)) => rejection = message,
+        }
+    }
+
+    Err(format!("Не удалось получить тикет: {rejection}"))
+}
+
+fn ticket_for_shape(cookie: &str, body: &str, content_type: &str) -> Result<String, TicketFailure> {
     let mut csrf: Option<String> = None;
 
     for attempt in 0..2 {
         let mut request = ureq::post(TICKET_URL)
             .set("Cookie", &format!(".ROBLOSECURITY={cookie}"))
+            .set("Content-Type", content_type)
             .set("User-Agent", USER_AGENT)
             .set("Accept", "application/json")
             .set("Referer", "https://www.roblox.com/")
@@ -178,45 +207,61 @@ pub fn fetch_ticket(raw_cookie: &str) -> Result<String, String> {
             request = request.set("X-CSRF-TOKEN", token);
         }
 
-        match request.call() {
+        match request.send_string(body) {
             Ok(response) => {
                 return response
                     .header("rbx-authentication-ticket")
                     .map(str::to_string)
-                    .ok_or_else(|| "Roblox не выдал authentication ticket".to_string());
+                    .ok_or_else(|| {
+                        TicketFailure::Fatal("Roblox не выдал authentication ticket".into())
+                    });
             }
             Err(ureq::Error::Status(403, response)) => {
                 let token = response.header("x-csrf-token").map(str::to_string);
-                match token {
-                    Some(token) if attempt == 0 => {
+                match (token, attempt) {
+                    (Some(token), 0) => {
                         csrf = Some(token);
                         continue;
                     }
-                    // A token that the server still rejects means the session
+                    // A fresh token that the server rejects means the session
                     // itself is not valid any more.
-                    _ if attempt == 1 => {
-                        return Err("Cookie недействителен: Roblox не принял CSRF-токен".into())
+                    (Some(_), _) => {
+                        return Err(TicketFailure::Fatal(
+                            "Cookie недействителен: Roblox не принял CSRF-токен".into(),
+                        ))
                     }
-                    _ => {
+                    (None, _) => {
                         let body = response.into_string().unwrap_or_default();
-                        return Err(format!(
-                            "Roblox отклонил запрос тикета (HTTP 403, без CSRF): {}",
+                        return Err(TicketFailure::TryAnother(format!(
+                            "HTTP 403 без CSRF ({content_type}): {}",
                             summarize(&body)
-                        ));
+                        )));
                     }
                 }
             }
             Err(ureq::Error::Status(401, _)) => {
-                return Err("Cookie недействителен (тикет не выдан)".into())
+                return Err(TicketFailure::Fatal(
+                    "Cookie недействителен (тикет не выдан)".into(),
+                ))
+            }
+            // Wrong media type or a malformed body: retry with the next shape.
+            Err(ureq::Error::Status(code @ (400 | 415 | 422), response)) => {
+                let body = response.into_string().unwrap_or_default();
+                return Err(TicketFailure::TryAnother(format!(
+                    "HTTP {code} ({content_type}): {}",
+                    summarize(&body)
+                )));
             }
             Err(ureq::Error::Status(code, _)) => {
-                return Err(format!("Не удалось получить тикет: HTTP {code}"))
+                return Err(TicketFailure::Fatal(format!("Roblox ответил HTTP {code}")))
             }
-            Err(err) => return Err(format!("Нет связи с Roblox: {err}")),
+            Err(err) => return Err(TicketFailure::Fatal(format!("Нет связи с Roblox: {err}"))),
         }
     }
 
-    Err("Roblox не выдал authentication ticket".into())
+    Err(TicketFailure::Fatal(
+        "Roblox не выдал authentication ticket".into(),
+    ))
 }
 
 /// Short single-line version of an error body, safe for the status bar.
