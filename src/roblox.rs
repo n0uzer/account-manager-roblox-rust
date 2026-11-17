@@ -303,24 +303,27 @@ fn random_tracker() -> u64 {
     rand::random::<u64>() % 9_000_000_000 + 1_000_000_000
 }
 
-/// Locate `RobloxPlayerBeta.exe`: protocol handler from the registry first,
-/// then the usual `Roblox\Versions` folders. With several versions installed
-/// the most recently updated one wins.
+/// Folders that keep the real player next to themselves.
+///
+/// `Roblox\Versions` is the stock location; bootstrappers install into their
+/// own folder instead and never populate the stock one.
+const VERSION_OWNERS: [&str; 3] = ["Roblox", "Bloxstrap", "Voidstrap"];
+
+/// Locate `RobloxPlayerBeta.exe`.
+///
+/// The `roblox-player` protocol handler is trusted only when it points at the
+/// player itself. With Bloxstrap and its forks installed it points at
+/// `Bloxstrap.exe`, which does not understand player arguments and just opens
+/// its own window instead of the game. Those installs keep the player under
+/// their own `Versions` folder, so every known location is scanned as well.
+/// With several versions installed the most recently updated one wins.
 pub fn find_client() -> Option<PathBuf> {
-    if let Some(path) = client_from_registry() {
+    if let Some(path) = client_from_registry().filter(|path| is_player(path)) {
         return Some(path);
     }
 
-    let mut roots = Vec::new();
-    if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(local).join("Roblox").join("Versions"));
-    }
-    if let Ok(program_files) = std::env::var("ProgramFiles(x86)") {
-        roots.push(PathBuf::from(program_files).join("Roblox").join("Versions"));
-    }
-
     let mut candidates = Vec::new();
-    for root in roots {
+    for root in version_roots() {
         let Ok(entries) = std::fs::read_dir(&root) else {
             continue;
         };
@@ -337,6 +340,35 @@ pub fn find_client() -> Option<PathBuf> {
             .and_then(|meta| meta.modified())
             .ok()
     })
+}
+
+/// Candidate `Versions` folders for the stock install and known bootstrappers.
+fn version_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        let local = PathBuf::from(local);
+        for owner in VERSION_OWNERS {
+            roots.push(local.join(owner).join("Versions"));
+        }
+    }
+    for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Ok(program_files) = std::env::var(variable) {
+            roots.push(PathBuf::from(program_files).join("Roblox").join("Versions"));
+        }
+    }
+
+    roots.retain(|root| root.is_dir());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Only an executable that is the player can be started with player arguments.
+fn is_player(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(CLIENT_EXE))
 }
 
 /// Read the path from `HKCU\Software\Classes\roblox-player\shell\open\command`.
@@ -531,6 +563,20 @@ mod tests {
                 "https://example/join",
             ]
         );
+    }
+
+    #[test]
+    fn only_the_player_executable_is_accepted() {
+        // Bloxstrap registers itself as the protocol handler; launching it with
+        // player arguments only opens its own window.
+        assert!(is_player(Path::new(
+            r"C:\Users\me\AppData\Local\Bloxstrap\Versions\version-abc\RobloxPlayerBeta.exe"
+        )));
+        assert!(is_player(Path::new(r"C:\Roblox\robloxplayerbeta.EXE")));
+        assert!(!is_player(Path::new(
+            r"C:\Users\me\AppData\Local\Bloxstrap\Bloxstrap.exe"
+        )));
+        assert!(!is_player(Path::new(r"C:\Windows\System32\reg.exe")));
     }
 
     #[test]

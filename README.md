@@ -17,6 +17,20 @@
 Готовый `rbm.exe` — на странице [Releases](../../releases). Сборка под Windows x64,
 запускается без установки и без зависимостей.
 
+Рядом с бинарником лежит `rbm.exe.sha256` — контрольная сумма в формате
+`sha256sum` (`<хеш>  rbm.exe`), чтобы можно было проверить скачанное:
+
+```powershell
+sha256sum -c rbm.exe.sha256
+```
+
+или без утилит:
+
+```powershell
+(Get-FileHash .\rbm.exe -Algorithm SHA256).Hash.ToLower() -eq `
+    (Get-Content .\rbm.exe.sha256).Split(' ')[0]
+```
+
 ---
 
 ## Возможности
@@ -139,10 +153,16 @@ Cookie: .ROBLOSECURITY=...
 
 ### Несколько окон: детали
 
-- Путь к клиенту берётся из реестра
-  `HKCU\Software\Classes\roblox-player\shell\open\command`, а если там пусто —
-  ищется самый свежий `RobloxPlayerBeta.exe` в
-  `%LOCALAPPDATA%\Roblox\Versions\version-*\` и `%ProgramFiles(x86)%\Roblox\Versions\`.
+- Путь к клиенту ищется так: реестр
+  `HKCU\Software\Classes\roblox-player\shell\open\command` принимается, только если
+  там действительно `RobloxPlayerBeta.exe`; иначе берётся самый свежий
+  `RobloxPlayerBeta.exe` из `%LOCALAPPDATA%\Roblox\Versions\version-*\`,
+  `%LOCALAPPDATA%\Bloxstrap\Versions`, `%LOCALAPPDATA%\Voidstrap\Versions` и
+  `%ProgramFiles(x86)%\Roblox\Versions\`.
+- Bloxstrap и его форки переписывают обработчик протокола на себя
+  (`Bloxstrap.exe -player "%1"`), поэтому такой путь игнорируется: лаунчер не понимает
+  аргументы плеера и открывает своё меню вместо игры. Настоящий клиент лежит в папке
+  `Versions` рядом с лаунчером и запускается напрямую.
 - Пакетный запуск идёт из очереди: один аккаунт за тик с паузой **1.5 с**,
   чтобы Roblox не посчитал пачку тикетов подозрительной активностью.
 - Порядок — как аккаунты отмечены галочками в колонке «Окно».
@@ -167,7 +187,9 @@ Cookie: .ROBLOSECURITY=...
 Как это работает:
 
 - FPS и качество попадают в файл
-  `%LOCALAPPDATA%\Roblox\Versions\version-<hash>\ClientSettings\ClientAppSettings.json`.
+  `ClientSettings\ClientAppSettings.json` внутри папки версии клиента
+  (`...\Versions\version-<hash>\`), где бы эта папка ни лежала —
+  в `Roblox` или рядом с Bloxstrap.
   Клиент читает его **только при старте**, поэтому файл перезаписывается перед каждым
   запуском. Чужие ключи в файле сохраняются, наши значения пишутся строками —
   так их ждёт клиент.
