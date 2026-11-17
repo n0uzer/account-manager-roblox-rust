@@ -154,34 +154,58 @@ pub fn fetch_identity(raw_cookie: &str) -> Result<Profile, String> {
     }
 }
 
-/// Exchange the cookie for an authentication ticket (needs a CSRF token).
+/// Exchange the cookie for an authentication ticket.
+///
+/// Flow: an empty POST first returns `403` plus an `x-csrf-token` header, then
+/// the same POST with that token returns the ticket. The empty request must not
+/// carry `Content-Type` nor an empty `X-CSRF-TOKEN`: Roblox rejects such a
+/// request with a `403` that has no CSRF header, which looks like a dead cookie.
 pub fn fetch_ticket(raw_cookie: &str) -> Result<String, String> {
     let cookie = clean_cookie(raw_cookie);
-    let mut csrf = String::new();
+    if cookie.is_empty() {
+        return Err("Пустой cookie".into());
+    }
+    let mut csrf: Option<String> = None;
 
-    // First request is normally rejected with 403 and hands out the token.
-    for _ in 0..2 {
-        let result = ureq::post(TICKET_URL)
+    for attempt in 0..2 {
+        let mut request = ureq::post(TICKET_URL)
             .set("Cookie", &format!(".ROBLOSECURITY={cookie}"))
-            .set("X-CSRF-TOKEN", &csrf)
-            .set("Content-Type", "application/json")
             .set("User-Agent", USER_AGENT)
-            .send_string("");
+            .set("Accept", "application/json")
+            .set("Referer", "https://www.roblox.com/")
+            .set("Origin", "https://www.roblox.com");
+        if let Some(token) = csrf.as_deref() {
+            request = request.set("X-CSRF-TOKEN", token);
+        }
 
-        match result {
+        match request.call() {
             Ok(response) => {
                 return response
                     .header("rbx-authentication-ticket")
                     .map(str::to_string)
                     .ok_or_else(|| "Roblox не выдал authentication ticket".to_string());
             }
-            Err(ureq::Error::Status(403, response)) => match response.header("x-csrf-token") {
-                Some(token) => {
-                    csrf = token.to_string();
-                    continue;
+            Err(ureq::Error::Status(403, response)) => {
+                let token = response.header("x-csrf-token").map(str::to_string);
+                match token {
+                    Some(token) if attempt == 0 => {
+                        csrf = Some(token);
+                        continue;
+                    }
+                    // A token that the server still rejects means the session
+                    // itself is not valid any more.
+                    _ if attempt == 1 => {
+                        return Err("Cookie недействителен: Roblox не принял CSRF-токен".into())
+                    }
+                    _ => {
+                        let body = response.into_string().unwrap_or_default();
+                        return Err(format!(
+                            "Roblox отклонил запрос тикета (HTTP 403, без CSRF): {}",
+                            summarize(&body)
+                        ));
+                    }
                 }
-                None => return Err("Cookie недействителен (нет CSRF-токена)".into()),
-            },
+            }
             Err(ureq::Error::Status(401, _)) => {
                 return Err("Cookie недействителен (тикет не выдан)".into())
             }
@@ -193,6 +217,17 @@ pub fn fetch_ticket(raw_cookie: &str) -> Result<String, String> {
     }
 
     Err("Roblox не выдал authentication ticket".into())
+}
+
+/// Short single-line version of an error body, safe for the status bar.
+fn summarize(body: &str) -> String {
+    let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text: String = text.chars().take(160).collect();
+    if text.is_empty() {
+        "пустой ответ".to_string()
+    } else {
+        text
+    }
 }
 
 /// Build the `roblox-player:` deeplink for the system protocol handler.
@@ -366,4 +401,48 @@ pub fn launch_game(
         kind: LaunchKind::Deeplink,
         notes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cookie_prefixes_and_quotes_are_removed() {
+        assert_eq!(clean_cookie("  abc  "), "abc");
+        assert_eq!(clean_cookie(".ROBLOSECURITY=abc"), "abc");
+        assert_eq!(clean_cookie(".roblosecurity=\"abc\""), "abc");
+        assert_eq!(clean_cookie(".ROBLOSECURITY='abc'"), "abc");
+    }
+
+    #[test]
+    fn cookie_warning_prefix_is_kept() {
+        // The warning text is part of the real cookie value.
+        let raw = "_|WARNING:-DO-NOT-SHARE-THIS.|_abc";
+        assert_eq!(clean_cookie(raw), raw);
+    }
+
+    #[test]
+    fn error_body_is_flattened_and_cut() {
+        assert_eq!(summarize("a\n  b\tc"), "a b c");
+        assert_eq!(summarize(""), "пустой ответ");
+        assert_eq!(summarize(&"x".repeat(500)).len(), 160);
+    }
+
+    #[test]
+    fn limits_zero_means_defaults() {
+        let none = Limits::default();
+        assert!(!none.has_settings());
+        assert!(!none.has_size());
+
+        let limits = Limits {
+            fps_cap: 60,
+            quality: 1,
+            width: 960,
+            height: 540,
+        };
+        assert!(limits.has_settings());
+        assert!(limits.has_size());
+        assert_eq!(limits.settings_note(), "FPS ≤ 60, графика 1");
+    }
 }
