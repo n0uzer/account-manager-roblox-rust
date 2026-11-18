@@ -13,7 +13,6 @@ use crate::jobs::{self, Done, Job};
 use crate::roblox::{self, CheckError};
 use crate::singleton;
 use crate::store::{self, Account, Store, MIN_PASSWORD_CHARS};
-use crate::throttle;
 
 const CLIPBOARD_TTL: Duration = Duration::from_secs(60);
 /// Gap between queued launches: Roblox dislikes a burst of ticket requests.
@@ -686,8 +685,9 @@ impl App {
             fps.on_hover_text(
                 "Любое число кадров в секунду, 0 — без ограничения.\n\
                  Пишется в ClientAppSettings.json как DFIntTaskSchedulerTargetFps.\n\
-                 Roblox применяет только флаги из своего allowlist, а этого ключа там \
-                 нет: актуальные клиенты значение игнорируют. Реальная мера — поле CPU.",
+                 Актуальный клиент этот ключ отклоняет: в его логе появляется\n\
+                 «Denied local configuration for: DFIntTaskSchedulerTargetFps».\n\
+                 Значение остаётся для старых клиентов и сборок без allowlist.",
             );
             if self.config.fps_cap == 0 {
                 ui.label("(без лимита)");
@@ -738,22 +738,6 @@ impl App {
                         "Высота клиентской области окна в пикселях.\n\
                          0 в ширине или высоте — окно обычного размера.",
                     );
-
-                    ui.label("CPU:");
-                    let cpu = number(ui, &mut self.config.cpu_percent, 0..=100, " %");
-                    save |= persist_now(&cpu);
-                    cpu.on_hover_text(
-                        "Жёсткий лимит доли процессора на одно окно, 0 — без ограничения.\n\
-                         Работает на уровне Windows (job object), клиент его не отменяет.\n\
-                         Это доля всего процессора, а не одного ядра.\n\
-                         Меньше значение — меньше FPS, но и меньше нагрузки.",
-                    );
-                    if self.config.cpu_percent > 0 {
-                        ui.label(cores_note(
-                            self.config.cpu_percent,
-                            throttle::logical_cpus(),
-                        ));
-                    }
 
                     save
                 })
@@ -1749,7 +1733,6 @@ impl App {
         roblox::Limits {
             fps_cap: self.config.fps_cap,
             quality: self.config.graphics_quality,
-            cpu_percent: self.config.cpu_percent,
             width: self.config.window_width,
             height: self.config.window_height,
         }
@@ -2226,30 +2209,6 @@ fn persist_now(response: &egui::Response) -> bool {
     response.changed() && (!response.dragged() || response.drag_stopped())
 }
 
-/// "0.6 ядра" / "1 ядро" / "12 ядер": how much CPU a percentage really is.
-fn cores_note(percent: u32, cpus: u32) -> String {
-    let cores = (percent as f32 / 100.0 * cpus as f32 * 10.0).round() / 10.0;
-    let whole = cores.round() as u32;
-    let is_whole = (cores - whole as f32).abs() < 0.001;
-
-    let amount = if is_whole {
-        whole.to_string()
-    } else {
-        format!("{cores:.1}")
-    };
-    let word = if !is_whole {
-        "ядра"
-    } else {
-        match (whole % 100, whole % 10) {
-            (11..=14, _) => "ядер",
-            (_, 1) => "ядро",
-            (_, 2..=4) => "ядра",
-            _ => "ядер",
-        }
-    };
-    format!("≈ {amount} {word}")
-}
-
 /// Combo box over `(value, caption)` pairs. Returns the value picked this frame.
 fn pick<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
@@ -2415,15 +2374,5 @@ mod tests {
     fn auto_lock_captions() {
         assert_eq!(auto_lock_text(0), "выкл");
         assert_eq!(auto_lock_text(15), "15 мин");
-    }
-
-    #[test]
-    fn cpu_budget_is_explained_in_cores() {
-        // A share of the whole CPU, not of one core.
-        assert_eq!(cores_note(5, 12), "≈ 0.6 ядра");
-        assert_eq!(cores_note(10, 10), "≈ 1 ядро");
-        assert_eq!(cores_note(30, 10), "≈ 3 ядра");
-        assert_eq!(cores_note(100, 12), "≈ 12 ядер");
-        assert_eq!(cores_note(100, 11), "≈ 11 ядер");
     }
 }

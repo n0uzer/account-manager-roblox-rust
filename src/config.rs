@@ -44,8 +44,6 @@ pub struct Config {
     pub fps_cap: u32,
     /// Graphics quality 1..=10, 0 keeps the game default.
     pub graphics_quality: u32,
-    /// Hard CPU budget per window in percent, 0 means "no limit".
-    pub cpu_percent: u32,
     /// Client area size in `--app` mode, 0x0 keeps the default window.
     pub window_width: u32,
     pub window_height: u32,
@@ -62,7 +60,6 @@ impl Default for Config {
             // non-zero default would only produce a misleading status note.
             fps_cap: 0,
             graphics_quality: 0,
-            cpu_percent: 0,
             window_width: 0,
             window_height: 0,
         }

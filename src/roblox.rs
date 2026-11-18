@@ -11,7 +11,6 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::client_settings;
-use crate::throttle;
 use crate::window;
 
 pub const USER_AGENT: &str = "RbxAccountManager/1.0 (local open-source tool)";
@@ -47,8 +46,6 @@ pub struct Limits {
     pub fps_cap: u32,
     /// Graphics quality 1..=10 via `DFIntDebugFRMQualityLevelOverride`.
     pub quality: u32,
-    /// Hard CPU budget in percent via a job object, 0 means "no limit".
-    pub cpu_percent: u32,
     /// Client area width, applied only in `--app` mode.
     pub width: u32,
     /// Client area height, applied only in `--app` mode.
@@ -550,16 +547,6 @@ pub fn launch_game(
         let join_url = build_join_url(place_id, random_tracker());
         let child = spawn_new_window(&exe, &ticket, &join_url)?;
 
-        // The CPU budget is the lever that actually works: the FPS flag is
-        // filtered out by the client's allowlist.
-        if limits.cpu_percent > 0 {
-            match throttle::limit(child.id(), limits.cpu_percent) {
-                Ok(note) if !note.is_empty() => notes.push(note),
-                Ok(_) => {}
-                Err(err) => notes.push(err),
-            }
-        }
-
         if limits.has_size() {
             window::resize_when_ready(child.id(), limits.width, limits.height);
             notes.push(format!("окно {}×{}", limits.width, limits.height));
@@ -618,7 +605,6 @@ mod tests {
         let limits = Limits {
             fps_cap: 60,
             quality: 1,
-            cpu_percent: 25,
             width: 960,
             height: 540,
         };

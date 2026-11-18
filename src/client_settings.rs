@@ -5,11 +5,11 @@
 //! how every tool writes them, including Bloxstrap.
 //! Roblox updates replace that folder, so the file is rewritten before each launch.
 //!
-//! Since 2026 the client applies only flags listed in
-//! `clientsettingscdn.roblox.com/v2/settings/application/PCDesktopClient`, and
-//! neither key below is on that list, so current clients ignore them. The file
-//! is still written: older clients and builds with the allowlist disabled read
-//! it, and the real load limiter is the job-object CPU cap in [`crate::throttle`].
+//! Since 2026 the client filters its own overrides through a fast-flag
+//! allowlist. The FPS key is dropped — the client logs
+//! `Denied local configuration for: DFIntTaskSchedulerTargetFps` — while the
+//! quality key is accepted. The FPS value is still written for older clients
+//! and for builds without the allowlist.
 
 use std::fs;
 use std::path::{Path, PathBuf};
