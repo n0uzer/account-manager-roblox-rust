@@ -11,6 +11,7 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::client_settings;
+use crate::game_settings;
 use crate::window;
 
 pub const USER_AGENT: &str = "RbxAccountManager/1.0 (local open-source tool)";
@@ -515,10 +516,12 @@ fn spawn_new_window(
 /// * `multi == false` — system `roblox-player:` handler, single window.
 /// * `multi == true`  — direct client start with `--app`, new window every call.
 ///
-/// FPS and quality limits are written into `ClientSettings/ClientAppSettings.json`
-/// inside the client version folder before the client starts, because the client
-/// reads that file only at startup. The window size is applied afterwards, which
-/// is possible only for windows we spawned ourselves.
+/// The FPS cap and the start window size go into the client's own settings file
+/// (`GlobalBasicSettings_13.xml`), which is where the in-game menu writes them.
+/// The quality override goes into `ClientSettings/ClientAppSettings.json` in the
+/// client version folder. Both files are read only at startup, so both are
+/// rewritten before every launch. The window size is also enforced afterwards,
+/// because the client may restore its own size while loading.
 pub fn launch_game(
     place_id: u64,
     cookie: &str,
@@ -537,6 +540,14 @@ pub fn launch_game(
                 Err(err) => notes.push(format!("настройки клиента не применены: {err}")),
             },
             None => notes.push("клиент не найден: FPS/графику не применил".into()),
+        }
+    }
+
+    // The client's own settings file is what actually caps frames and sets the
+    // start size: the matching fast flags are denied by the client.
+    if limits.fps_cap > 0 || limits.has_size() {
+        if let Err(err) = game_settings::apply(limits.fps_cap, limits.width, limits.height) {
+            notes.push(format!("настройки игры не применены: {err}"));
         }
     }
 

@@ -11,6 +11,7 @@ mod client_settings;
 mod config;
 mod crypto;
 mod dpapi;
+mod game_settings;
 mod jobs;
 mod roblox;
 mod singleton;

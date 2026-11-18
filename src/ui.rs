@@ -684,9 +684,10 @@ impl App {
             save |= persist_now(&fps);
             fps.on_hover_text(
                 "Любое число кадров в секунду, 0 — без ограничения.\n\
-                 Пишутся два ключа: DFIntFRMConstantFrameTimeTargetMs (бюджет кадра \
-                 в миллисекундах, актуальный клиент его применяет) и \
-                 DFIntTaskSchedulerTargetFps (для старых клиентов).\n\
+                 Пишется в настройки клиента — GlobalBasicSettings_13.xml, поле \
+                 FramerateCap. Это та же настройка, что в меню игры, поэтому клиент \
+                 её применяет (в отличие от fast-флагов вроде \
+                 DFIntTaskSchedulerTargetFps, которые он отклоняет).\n\
                  Проверить: Esc → Настройки → Производительность.",
             );
             if self.config.fps_cap == 0 {
@@ -728,7 +729,11 @@ impl App {
                     ui.label("Разрешение окна:");
                     let width = number(ui, &mut self.config.window_width, 0..=7680, " px");
                     save |= persist_now(&width);
-                    width.on_hover_text("Ширина клиентской области окна в пикселях.");
+                    width.on_hover_text(
+                        "Ширина клиентской области окна в пикселях.\n\
+                         Пишется в настройки клиента (StartScreenSize) и удерживается \
+                         первые 90 секунд после запуска.",
+                    );
 
                     ui.label("×");
 

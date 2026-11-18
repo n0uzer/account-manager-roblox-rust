@@ -24,9 +24,10 @@ pub fn resize_when_ready(pid: u32, width: u32, height: u32) {
     if width == 0 || height == 0 {
         return;
     }
-    // Anything smaller is not a playable window; the UI never sends this.
-    let width = width.max(320);
-    let height = height.max(240);
+    // Tiny windows are fine: six clients at 640x360 is the whole point. Only a
+    // size that cannot hold a frame at all is refused.
+    let width = width.max(200);
+    let height = height.max(150);
 
     let spawned = std::thread::Builder::new()
         .name("rbm-window".into())
