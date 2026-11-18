@@ -46,6 +46,8 @@ pub struct Config {
     pub graphics_quality: u32,
     /// Texture quality 0..=3, `None` keeps the game default.
     pub texture_quality: Option<u32>,
+    /// Give background clients' memory back to the system on a timer.
+    pub trim_memory: bool,
     /// Client area size in `--app` mode, 0x0 keeps the default window.
     pub window_width: u32,
     pub window_height: u32,
@@ -63,6 +65,7 @@ impl Default for Config {
             fps_cap: 0,
             graphics_quality: 0,
             texture_quality: None,
+            trim_memory: false,
             window_width: 0,
             window_height: 0,
         }

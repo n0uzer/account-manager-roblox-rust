@@ -10,6 +10,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::{Config, SortKey};
 use crate::jobs::{self, Done, Job};
+use crate::memory;
 use crate::roblox::{self, CheckError};
 use crate::singleton;
 use crate::store::{self, Account, Store, MIN_PASSWORD_CHARS};
@@ -267,6 +268,11 @@ impl App {
             if let Err(message) = singleton::enable() {
                 app.warn(message);
             }
+        }
+
+        // Background clients give their memory back on a timer.
+        if app.config.trim_memory {
+            memory::enable();
         }
 
         app
@@ -782,9 +788,26 @@ impl App {
             } else {
                 ui.label("(только для «Несколько окон»): deeplink не отдаёт нам процесс")
                     .on_hover_text(
-                        "Размер окна и лимит CPU задаются только у клиентов, которых \
-                         запустил менеджер через --app.",
+                        "Размер окна задаётся только у клиентов, которых запустил \
+                         менеджер через --app.",
                     );
+            }
+
+            if ui
+                .checkbox(&mut self.config.trim_memory, "Экономить ОЗУ")
+                .on_hover_text(
+                    "Раз в 30 секунд отдаёт системе память фоновых окон клиента \
+                     (EmptyWorkingSet). Окно в фокусе не трогается, поэтому игра, \
+                     в которой ты сейчас, не тормозит.\n\
+                     Процессы не закрываются: их страницы уходят в подкачку и \
+                     возвращаются в память по мере надобности.",
+                )
+                .changed()
+            {
+                if self.config.trim_memory {
+                    memory::enable();
+                }
+                save = true;
             }
         });
 

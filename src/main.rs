@@ -13,6 +13,8 @@ mod crypto;
 mod dpapi;
 mod game_settings;
 mod jobs;
+mod memory;
+mod processes;
 mod roblox;
 mod singleton;
 mod store;
