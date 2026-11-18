@@ -57,6 +57,10 @@ fn apply_at(path: &Path, fps: u32, width: u32, height: u32) -> Result<bool, Stri
         }
     }
     if width > 0 && height > 0 {
+        // The client clamps its window to 800x600 anyway; writing less would
+        // only be overwritten on the next start.
+        let width = width.max(800);
+        let height = height.max(600);
         if let Some(next) = replace_screen_size(&patched, width, height) {
             patched = next;
         }
@@ -190,13 +194,28 @@ mod tests {
         let path = dir.join("GlobalBasicSettings_13.xml");
         std::fs::write(&path, SAMPLE).unwrap();
 
-        assert_eq!(apply_at(&path, 30, 640, 360), Ok(true));
+        assert_eq!(apply_at(&path, 30, 800, 600), Ok(true));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("<int name=\"FramerateCap\">30</int>"));
-        assert!(text.contains("<X>640</X><Y>360</Y>"));
+        assert!(text.contains("<X>800</X><Y>600</Y>"));
 
         // Nothing changes the second time, so the file is not rewritten.
-        assert_eq!(apply_at(&path, 30, 640, 360), Ok(false));
+        assert_eq!(apply_at(&path, 30, 800, 600), Ok(false));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sizes_below_the_client_minimum_are_raised() {
+        let dir = std::env::temp_dir().join(format!("rbm-settings-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("GlobalBasicSettings_13.xml");
+        std::fs::write(&path, SAMPLE).unwrap();
+
+        // 100x100 is not a window the client can draw in.
+        assert_eq!(apply_at(&path, 0, 100, 100), Ok(true));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("<X>800</X><Y>600</Y>"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,15 +1,17 @@
-//! Roblox client overrides: FPS cap and graphics quality.
+//! Roblox client overrides: FPS cap, graphics quality and texture quality.
 //!
 //! The client reads `ClientSettings/ClientAppSettings.json` from its own version
 //! folder at startup. Values there are FFlag **strings**, not numbers — that is
 //! how every tool writes them, including Bloxstrap.
 //! Roblox updates replace that folder, so the file is rewritten before each launch.
 //!
-//! Since 2026 the client filters its own overrides through a fast-flag
-//! allowlist. The classic FPS key is dropped — the client logs
-//! `Denied local configuration for: DFIntTaskSchedulerTargetFps` — while the
-//! quality key and the Frame Rate Manager frame budget are accepted. All three
-//! are written: the classic key still works on older clients.
+//! Since 2026 the client filters local overrides through a list of its own.
+//! Measured on a live client: `DFIntTaskSchedulerTargetFps`, the Frame Rate
+//! Manager frame budget, every DRS and render-scale key and the MSAA override are
+//! denied (`Denied local configuration for: …` in the client log), while the
+//! quality, texture-quality and texture-quality-enabled keys are accepted. The
+//! FPS cap itself lives in the client's own settings file, see
+//! [`crate::game_settings`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,11 +19,14 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 pub const FPS_KEY: &str = "DFIntTaskSchedulerTargetFps";
-/// Frame Rate Manager: target frame time in milliseconds. This one is on the
-/// client's fast-flag allowlist, so current clients apply it — unlike
-/// [`FPS_KEY`], which they deny.
+/// Frame Rate Manager: target frame time in milliseconds. Denied by current
+/// clients, kept for older ones.
 pub const FRAME_TIME_KEY: &str = "DFIntFRMConstantFrameTimeTargetMs";
 pub const QUALITY_KEY: &str = "DFIntDebugFRMQualityLevelOverride";
+/// Turns the texture override on; the level itself is in [`TEXTURE_KEY`].
+pub const TEXTURE_ENABLED_KEY: &str = "DFFlagTextureQualityOverrideEnabled";
+/// Texture quality level 0..=3, lower means smaller textures and less memory.
+pub const TEXTURE_KEY: &str = "DFIntTextureQualityOverride";
 
 /// Frame budget for a target FPS, rounded to the nearest millisecond. 30 fps
 /// becomes 33 ms, 60 fps becomes 17 ms.
@@ -31,7 +36,12 @@ fn frame_time_ms(fps: u32) -> u32 {
 
 /// Merge our overrides into the existing settings, keeping foreign keys intact.
 /// A zero value removes the key, so "off" really means "game default".
-pub fn merge(existing: Option<&Value>, fps: u32, quality: u32) -> Map<String, Value> {
+pub fn merge(
+    existing: Option<&Value>,
+    fps: u32,
+    quality: u32,
+    texture: Option<u32>,
+) -> Map<String, Value> {
     let mut map = existing
         .and_then(Value::as_object)
         .cloned()
@@ -54,12 +64,31 @@ pub fn merge(existing: Option<&Value>, fps: u32, quality: u32) -> Map<String, Va
         map.remove(QUALITY_KEY);
     }
 
+    match texture {
+        Some(level) => {
+            map.insert(
+                TEXTURE_ENABLED_KEY.to_string(),
+                Value::String("True".to_string()),
+            );
+            map.insert(TEXTURE_KEY.to_string(), Value::String(level.to_string()));
+        }
+        None => {
+            map.remove(TEXTURE_ENABLED_KEY);
+            map.remove(TEXTURE_KEY);
+        }
+    }
+
     map
 }
 
 /// Write the overrides next to the client executable.
 /// Returns the file path when the file was actually touched.
-pub fn apply(client_exe: &Path, fps: u32, quality: u32) -> Result<Option<PathBuf>, String> {
+pub fn apply(
+    client_exe: &Path,
+    fps: u32,
+    quality: u32,
+    texture: Option<u32>,
+) -> Result<Option<PathBuf>, String> {
     let folder = client_exe
         .parent()
         .ok_or_else(|| "Не понял, где лежит клиент Roblox".to_string())?
@@ -71,11 +100,11 @@ pub fn apply(client_exe: &Path, fps: u32, quality: u32) -> Result<Option<PathBuf
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
 
     // Without limits and without an existing file there is nothing to do.
-    if fps == 0 && quality == 0 && current.is_none() {
+    if fps == 0 && quality == 0 && texture.is_none() && current.is_none() {
         return Ok(None);
     }
 
-    let merged = merge(current.as_ref(), fps, quality);
+    let merged = merge(current.as_ref(), fps, quality, texture);
     fs::create_dir_all(&folder).map_err(|err| format!("не могу создать ClientSettings: {err}"))?;
     let json = serde_json::to_vec_pretty(&Value::Object(merged))
         .map_err(|err| format!("не могу собрать настройки клиента: {err}"))?;
@@ -93,15 +122,35 @@ mod tests {
 
     #[test]
     fn writes_limits_as_strings() {
-        let merged = merge(None, 60, 3);
+        let merged = merge(None, 60, 3, None);
         assert_eq!(text(&merged, FPS_KEY).as_deref(), Some("60"));
         assert_eq!(text(&merged, FRAME_TIME_KEY).as_deref(), Some("17"));
         assert_eq!(text(&merged, QUALITY_KEY).as_deref(), Some("3"));
     }
 
     #[test]
+    fn texture_quality_needs_both_keys() {
+        // The level alone does nothing: the override has to be enabled.
+        let merged = merge(None, 0, 0, Some(1));
+        assert_eq!(text(&merged, TEXTURE_ENABLED_KEY).as_deref(), Some("True"));
+        assert_eq!(text(&merged, TEXTURE_KEY).as_deref(), Some("1"));
+
+        // Level zero is a real level, not "off".
+        let lowest = merge(None, 0, 0, Some(0));
+        assert_eq!(text(&lowest, TEXTURE_KEY).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn no_texture_choice_removes_both_keys() {
+        let existing = serde_json::json!({ TEXTURE_ENABLED_KEY: "True", TEXTURE_KEY: "2" });
+        let merged = merge(Some(&existing), 0, 0, None);
+        assert!(!merged.contains_key(TEXTURE_ENABLED_KEY));
+        assert!(!merged.contains_key(TEXTURE_KEY));
+    }
+
+    #[test]
     fn fps_becomes_a_frame_budget() {
-        // The allowlisted key is a frame time, not a frame rate.
+        // The FRM key takes a frame time, not a frame rate.
         assert_eq!(frame_time_ms(30), 33);
         assert_eq!(frame_time_ms(60), 17);
         assert_eq!(frame_time_ms(20), 50);
@@ -113,7 +162,7 @@ mod tests {
     #[test]
     fn keeps_foreign_keys_from_other_tools() {
         let existing = serde_json::json!({ "FFlagSomething": "True", FPS_KEY: "144" });
-        let merged = merge(Some(&existing), 30, 0);
+        let merged = merge(Some(&existing), 30, 0, None);
 
         assert_eq!(text(&merged, "FFlagSomething").as_deref(), Some("True"));
         assert_eq!(text(&merged, FPS_KEY).as_deref(), Some("30"));
@@ -123,13 +172,13 @@ mod tests {
     #[test]
     fn zero_removes_previous_limits() {
         let existing = serde_json::json!({ FPS_KEY: "30", FRAME_TIME_KEY: "33", QUALITY_KEY: "1" });
-        let merged = merge(Some(&existing), 0, 0);
+        let merged = merge(Some(&existing), 0, 0, None);
         assert!(merged.is_empty());
     }
 
     #[test]
     fn garbage_previous_file_is_replaced() {
-        let merged = merge(None, 45, 0);
+        let merged = merge(None, 45, 0, None);
         assert_eq!(text(&merged, FPS_KEY).as_deref(), Some("45"));
     }
 }

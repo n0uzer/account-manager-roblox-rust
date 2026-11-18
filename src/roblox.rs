@@ -47,6 +47,9 @@ pub struct Limits {
     pub fps_cap: u32,
     /// Graphics quality 1..=10 via `DFIntDebugFRMQualityLevelOverride`.
     pub quality: u32,
+    /// Texture quality 0..=3 via `DFIntTextureQualityOverride`, `None` keeps
+    /// the game default.
+    pub texture: Option<u32>,
     /// Client area width, applied only in `--app` mode.
     pub width: u32,
     /// Client area height, applied only in `--app` mode.
@@ -55,7 +58,7 @@ pub struct Limits {
 
 impl Limits {
     fn has_settings(self) -> bool {
-        self.fps_cap > 0 || self.quality > 0
+        self.fps_cap > 0 || self.quality > 0 || self.texture.is_some()
     }
 
     fn has_size(self) -> bool {
@@ -70,6 +73,9 @@ impl Limits {
         }
         if self.quality > 0 {
             parts.push(format!("графика {}", self.quality));
+        }
+        if let Some(texture) = self.texture {
+            parts.push(format!("текстуры {texture}"));
         }
         parts.join(", ")
     }
@@ -534,11 +540,13 @@ pub fn launch_game(
 
     if limits.has_settings() {
         match client.as_deref() {
-            Some(exe) => match client_settings::apply(exe, limits.fps_cap, limits.quality) {
-                Ok(Some(_)) => notes.push(limits.settings_note()),
-                Ok(None) => {}
-                Err(err) => notes.push(format!("настройки клиента не применены: {err}")),
-            },
+            Some(exe) => {
+                match client_settings::apply(exe, limits.fps_cap, limits.quality, limits.texture) {
+                    Ok(Some(_)) => notes.push(limits.settings_note()),
+                    Ok(None) => {}
+                    Err(err) => notes.push(format!("настройки клиента не применены: {err}")),
+                }
+            }
             None => notes.push("клиент не найден: FPS/графику не применил".into()),
         }
     }
@@ -615,12 +623,13 @@ mod tests {
         let limits = Limits {
             fps_cap: 60,
             quality: 1,
+            texture: Some(1),
             width: 960,
             height: 540,
         };
         assert!(limits.has_settings());
         assert!(limits.has_size());
-        assert_eq!(limits.settings_note(), "FPS 60, графика 1");
+        assert_eq!(limits.settings_note(), "FPS 60, графика 1, текстуры 1");
     }
 
     #[test]

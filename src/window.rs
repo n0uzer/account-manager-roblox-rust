@@ -25,10 +25,11 @@ pub fn resize_when_ready(pid: u32, width: u32, height: u32) {
     if width == 0 || height == 0 {
         return;
     }
-    // Tiny windows are fine: six clients at 640x360 is the whole point. Only a
-    // size that cannot hold a frame at all is refused.
-    let width = width.max(200);
-    let height = height.max(150);
+    // The client refuses to go below an 800x600 client area: its own log shows
+    // the swapchain staying at 800x599 whatever size is requested. Asking for
+    // less only makes the pin fight the window for 90 seconds.
+    let width = width.max(800);
+    let height = height.max(600);
 
     let spawned = std::thread::Builder::new()
         .name("rbm-window".into())

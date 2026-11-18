@@ -722,6 +722,30 @@ impl App {
                 save = true;
             }
 
+            ui.label("Текстуры:");
+            let texture_options: Vec<(Option<u32>, String)> = vec![
+                (None, "по умолчанию".to_string()),
+                (Some(0), "минимум".to_string()),
+                (Some(1), "низкие".to_string()),
+                (Some(2), "средние".to_string()),
+                (Some(3), "высокие".to_string()),
+            ];
+            let (picked, response) = pick(
+                ui,
+                "texture-quality",
+                self.config.texture_quality,
+                &texture_options,
+                120.0,
+            );
+            response.on_hover_text(
+                "DFIntTextureQualityOverride: меньше уровень — меньше текстур держится \
+                 в памяти. Это самый сильный рычаг по ОЗУ и видеопамяти на одно окно.",
+            );
+            if let Some(level) = picked {
+                self.config.texture_quality = level;
+                save = true;
+            }
+
             let per_window = ui
                 .add_enabled_ui(multi, |ui| {
                     let mut save = false;
@@ -731,6 +755,7 @@ impl App {
                     save |= persist_now(&width);
                     width.on_hover_text(
                         "Ширина клиентской области окна в пикселях.\n\
+                         Клиент не даёт меньше 800×600 — это его собственный минимум.\n\
                          Пишется в настройки клиента (StartScreenSize) и удерживается \
                          первые 90 секунд после запуска.",
                     );
@@ -750,7 +775,10 @@ impl App {
             save |= per_window;
 
             if multi {
-                ui.label("(0 — как обычно)");
+                ui.label("(минимум 800×600)").on_hover_text(
+                    "Меньше 800×600 клиент не даёт: окно игры не сжимается ниже этого \
+                     размера, что бы мы ни просили.",
+                );
             } else {
                 ui.label("(только для «Несколько окон»): deeplink не отдаёт нам процесс")
                     .on_hover_text(
@@ -1738,6 +1766,7 @@ impl App {
         roblox::Limits {
             fps_cap: self.config.fps_cap,
             quality: self.config.graphics_quality,
+            texture: self.config.texture_quality,
             width: self.config.window_width,
             height: self.config.window_height,
         }
