@@ -1,12 +1,13 @@
 //! Win32 window sizing for the Roblox client we just spawned.
 //!
 //! The client has no command-line switch for its window size, so the window is
-//! resized after it appears. The client window belongs to a process we started,
-//! therefore it is found by process id, not by title.
+//! resized after it appears. The window is found by process, not by title.
 //!
 //! One resize is not enough: the first window is the small login box, and the
 //! client sizes the real one from its own saved settings once the place starts
-//! loading. The size is therefore pinned for a while instead of applied once.
+//! loading. The client may even move the game into a freshly started process, so
+//! every client process started after our launch is covered, not only the one we
+//! spawned. The size is pinned for a while instead of applied once.
 
 use std::time::{Duration, Instant};
 
@@ -17,9 +18,9 @@ const PIN_FOR: Duration = Duration::from_secs(90);
 /// How often the size is checked while pinned. Cheap: one `GetClientRect`.
 const PIN_POLL: Duration = Duration::from_millis(400);
 
-/// Keep the first visible top-level window of `pid` at a `width`x`height`
-/// **client area**. Runs on a short-lived thread: the client needs a moment to
-/// create the window, and the caller must not block.
+/// Keep every window of the client at a `width`x`height` **client area**.
+/// Runs on a short-lived thread: the client needs a moment to create the window,
+/// and the caller must not block.
 pub fn resize_when_ready(pid: u32, width: u32, height: u32) {
     if width == 0 || height == 0 {
         return;
@@ -38,12 +39,17 @@ pub fn resize_when_ready(pid: u32, width: u32, height: u32) {
 }
 
 fn pin(pid: u32, width: u32, height: u32) {
+    // Clients started before us belong to the user, not to this launch.
+    let since = win::now_filetime();
     let deadline = Instant::now() + PIN_FOR;
     while Instant::now() < deadline {
-        // Every visible window of the process is checked, not just the first
-        // one: the client replaces its login box with the real game window
-        // while the place loads, and that one starts at the saved size.
-        let fixed = win::resize_all(pid, width, height);
+        let mut fixed = win::resize_all(pid, width, height);
+        for other in win::client_pids_started_after(since) {
+            if other != pid {
+                fixed += win::resize_all(other, width, height);
+            }
+        }
+
         // Give the client time to react to WM_SIZE before the next pass.
         std::thread::sleep(if fixed > 0 {
             Duration::from_millis(250)
@@ -56,8 +62,43 @@ fn pin(pid: u32, width: u32, height: u32) {
 #[cfg(windows)]
 mod win {
     use std::ffi::c_void;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     type Hwnd = *mut c_void;
+    type Handle = *mut c_void;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    impl FileTime {
+        /// FILETIME counts 100 ns ticks since 1601-01-01.
+        fn ticks(&self) -> u64 {
+            ((self.high as u64) << 32) | self.low as u64
+        }
+    }
+
+    /// `PROCESSENTRY32W`: enough of the layout to read the name and the id.
+    #[repr(C)]
+    struct ProcessEntry32W {
+        size: u32,
+        usage: u32,
+        process_id: u32,
+        default_heap_id: usize,
+        module_id: u32,
+        threads: u32,
+        parent_process_id: u32,
+        pri_class_base: i32,
+        flags: u32,
+        exe_file: [u16; 260],
+    }
+
+    const TH32CS_SNAPPROCESS: u32 = 0x2;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const CLIENT_EXE: &str = "RobloxPlayerBeta.exe";
 
     #[repr(C)]
     struct Rect {
@@ -86,6 +127,22 @@ mod win {
             cy: i32,
             flags: u32,
         ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process: u32) -> Handle;
+        fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+        fn GetProcessTimes(
+            process: Handle,
+            creation: *mut FileTime,
+            exit: *mut FileTime,
+            kernel: *mut FileTime,
+            user: *mut FileTime,
+        ) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
     }
 
     const GWL_STYLE: i32 = -16;
@@ -148,6 +205,71 @@ mod win {
         pass.fixed
     }
 
+    /// Current time as a FILETIME tick count, for comparing process start times.
+    pub(super) fn now_filetime() -> u64 {
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        since.as_secs() * 10_000_000
+            + u64::from(since.subsec_nanos()) / 100
+            + 116_444_736_000_000_000
+    }
+
+    /// Ids of client processes started at or after `since`.
+    ///
+    /// The client can hand the game window to a process started after ours, so
+    /// knowing only the pid we spawned is not enough.
+    pub(super) fn client_pids_started_after(since: u64) -> Vec<u32> {
+        let mut pids = Vec::new();
+        // SAFETY: the snapshot handle is closed before returning.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot.is_null() || snapshot as isize == INVALID_HANDLE_VALUE {
+            return pids;
+        }
+
+        // SAFETY: `ProcessEntry32W` is plain data, so all-zero is valid, and
+        // `size` is set to what the API expects.
+        let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+        entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+
+        let mut more = unsafe { Process32FirstW(snapshot, &mut entry) };
+        while more != 0 {
+            if is_client(&entry) && started_after(entry.process_id, since) {
+                pids.push(entry.process_id);
+            }
+            more = unsafe { Process32NextW(snapshot, &mut entry) };
+        }
+
+        unsafe { CloseHandle(snapshot) };
+        pids
+    }
+
+    fn is_client(entry: &ProcessEntry32W) -> bool {
+        let len = entry
+            .exe_file
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(entry.exe_file.len());
+        let name = String::from_utf16_lossy(&entry.exe_file[..len]);
+        name.eq_ignore_ascii_case(CLIENT_EXE)
+    }
+
+    fn started_after(pid: u32, since: u64) -> bool {
+        // SAFETY: the handle is closed before returning.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        let mut creation = FileTime { low: 0, high: 0 };
+        let mut exit = FileTime { low: 0, high: 0 };
+        let mut kernel = FileTime { low: 0, high: 0 };
+        let mut user = FileTime { low: 0, high: 0 };
+        let ok =
+            unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+        unsafe { CloseHandle(process) };
+        ok != 0 && creation.ticks() >= since
+    }
+
     /// Size of the drawable area, i.e. what the user actually sees.
     fn client_size(hwnd: Hwnd) -> (i32, i32) {
         let mut rect = Rect {
@@ -204,5 +326,33 @@ mod win {
 mod win {
     pub(super) fn resize_all(_pid: u32, _width: u32, _height: u32) -> usize {
         0
+    }
+
+    pub(super) fn now_filetime() -> u64 {
+        0
+    }
+
+    pub(super) fn client_pids_started_after(_since: u64) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filetime_now_is_plausible() {
+        // 2020-01-01 as FILETIME ticks; anything sane is far above it.
+        let y2020 = 132_223_104_000_000_000u64;
+        assert!(win::now_filetime() > y2020);
+    }
+
+    #[test]
+    fn process_scan_is_safe() {
+        // Whether or not the client runs on this machine, the scan must finish
+        // and return real ids instead of garbage from a wrong struct layout.
+        let pids = win::client_pids_started_after(0);
+        assert!(pids.iter().all(|pid| *pid > 4));
     }
 }
