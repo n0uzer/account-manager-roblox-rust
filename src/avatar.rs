@@ -69,11 +69,8 @@ fn download(user_id: u64) -> Result<Vec<u8>, String> {
         .into_json()
         .map_err(|err| format!("Аватар: не разобрал ответ ({err})"))?;
 
-    let image_url = meta
-        .data
-        .into_iter()
-        .find_map(|entry| entry.image_url)
-        .ok_or_else(|| "Roblox не вернул ссылку на аватар".to_string())?;
+    let image_url = pick_image_url(meta)
+        .ok_or_else(|| "Roblox пока не отдал аватар (модерация или генерация)".to_string())?;
 
     let mut bytes = Vec::new();
     ureq::get(&image_url)
@@ -85,6 +82,14 @@ fn download(user_id: u64) -> Result<Vec<u8>, String> {
         .map_err(|err| format!("Аватар: {err}"))?;
 
     Ok(bytes)
+}
+
+/// First usable link. Roblox answers with an empty `imageUrl` while the
+/// thumbnail is still being generated or is blocked, which is not a link.
+fn pick_image_url(meta: ThumbResponse) -> Option<String> {
+    meta.data
+        .into_iter()
+        .find_map(|entry| entry.image_url.filter(|url| !url.trim().is_empty()))
 }
 
 fn decode(bytes: &[u8]) -> Result<AvatarImage, String> {
@@ -105,6 +110,25 @@ mod tests {
     #[test]
     fn garbage_png_is_rejected() {
         assert!(decode(b"not a png at all").is_err());
+    }
+
+    #[test]
+    fn empty_thumbnail_link_is_not_a_link() {
+        let pending: ThumbResponse =
+            serde_json::from_str(r#"{"data":[{"imageUrl":"","state":"Pending"}]}"#).unwrap();
+        assert_eq!(pick_image_url(pending), None);
+
+        let ready: ThumbResponse = serde_json::from_str(
+            r#"{"data":[{"imageUrl":null},{"imageUrl":"https://t.rbxcdn.com/a.png"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_image_url(ready).as_deref(),
+            Some("https://t.rbxcdn.com/a.png")
+        );
+
+        let none: ThumbResponse = serde_json::from_str(r#"{"data":[]}"#).unwrap();
+        assert_eq!(pick_image_url(none), None);
     }
 
     #[test]

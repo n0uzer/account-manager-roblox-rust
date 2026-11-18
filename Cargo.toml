@@ -19,6 +19,7 @@ arboard = "3"
 urlencoding = "2"
 zeroize = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.17.2"
 
 [profile.release]
 opt-level = "z"

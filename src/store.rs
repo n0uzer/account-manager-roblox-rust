@@ -5,14 +5,16 @@
 //! inside the encrypted blob — never on disk as-is.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto;
 
 const SCHEMA: u32 = 1;
+pub const MIN_PASSWORD_CHARS: usize = 6;
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Account {
@@ -27,10 +29,18 @@ pub struct Account {
     pub created_at: i64,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Deserialize, Default)]
 struct Payload {
+    #[allow(dead_code)]
     schema: u32,
     accounts: Vec<Account>,
+}
+
+/// Borrowed view used for saving: no second copy of every cookie is made.
+#[derive(Serialize)]
+struct PayloadRef<'a> {
+    schema: u32,
+    accounts: &'a [Account],
 }
 
 /// Decrypted contents plus the material needed to re-save the file.
@@ -82,8 +92,14 @@ impl Store {
 
     /// Create a new empty store protected by `password`.
     pub fn create(path: PathBuf, password: &str, dpapi: bool) -> Result<Self, String> {
-        if password.len() < 6 {
-            return Err("Пароль должен быть не короче 6 символов".into());
+        if path.exists() {
+            return Err("Файл хранилища уже существует, новый не создаю".into());
+        }
+        // Characters, not bytes: six Cyrillic letters are twelve bytes.
+        if password.chars().count() < MIN_PASSWORD_CHARS {
+            return Err(format!(
+                "Пароль должен быть не короче {MIN_PASSWORD_CHARS} символов"
+            ));
         }
         let salt = crypto::new_salt();
         let key = crypto::derive_key(password, &salt)?;
@@ -124,11 +140,12 @@ impl Store {
 
     /// Encrypt the payload and replace the file atomically (tmp + rename).
     pub fn save(&self) -> Result<(), String> {
-        let payload = Payload {
+        let payload = PayloadRef {
             schema: SCHEMA,
-            accounts: self.accounts.clone(),
+            accounts: &self.accounts,
         };
-        let json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
+        // The JSON holds every cookie in the clear: wipe it once encrypted.
+        let json = Zeroizing::new(serde_json::to_vec(&payload).map_err(|err| err.to_string())?);
         let encrypted = crypto::encrypt(&self.key, &self.salt, &json)?;
         let blob = if self.dpapi {
             crypto::dpapi_wrap(&encrypted)?
@@ -140,7 +157,13 @@ impl Store {
             fs::create_dir_all(parent).map_err(|err| format!("Не могу создать папку: {err}"))?;
         }
         let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, &blob).map_err(|err| format!("Не могу записать файл: {err}"))?;
+        let write = || -> std::io::Result<()> {
+            let mut file = fs::File::create(&tmp)?;
+            file.write_all(&blob)?;
+            // Flush to disk before the rename, so a crash cannot leave an empty store.
+            file.sync_all()
+        };
+        write().map_err(|err| format!("Не могу записать файл: {err}"))?;
         fs::rename(&tmp, &self.path).map_err(|err| format!("Не могу заменить файл: {err}"))?;
         Ok(())
     }
@@ -158,6 +181,16 @@ impl Store {
 
     pub fn find(&self, id: &str) -> Option<&Account> {
         self.accounts.iter().find(|account| account.id == id)
+    }
+
+    /// Account that already holds exactly this cookie, if any.
+    pub fn find_by_cookie(&self, cookie: &str) -> Option<&Account> {
+        if cookie.is_empty() {
+            return None;
+        }
+        self.accounts
+            .iter()
+            .find(|account| account.cookie == cookie)
     }
 
     fn find_mut(&mut self, id: &str) -> Option<&mut Account> {
@@ -214,6 +247,9 @@ impl Store {
     }
 
     pub fn remove(&mut self, id: &str) {
+        for account in self.accounts.iter_mut().filter(|account| account.id == id) {
+            account.cookie.zeroize();
+        }
         self.accounts.retain(|account| account.id != id);
     }
 
@@ -299,6 +335,49 @@ mod tests {
     fn short_password_is_refused() {
         let path = temp_path("accounts.dat");
         assert!(Store::create(path, "123", false).is_err());
+    }
+
+    #[test]
+    fn password_length_counts_characters_not_bytes() {
+        // Five Cyrillic letters are ten bytes, but still only five characters.
+        let path = temp_path("accounts.dat");
+        assert!(Store::create(path.clone(), "парол", false).is_err());
+        assert!(Store::create(path.clone(), "пароль", false).is_ok());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn existing_store_is_never_overwritten_by_create() {
+        let path = temp_path("accounts.dat");
+        let mut store = Store::create(path.clone(), "secret123", false).expect("create");
+        store.add("main", "cookie-value", "");
+        store.save().expect("save");
+        drop(store);
+
+        assert!(Store::create(path.clone(), "another-pass", false).is_err());
+        let reopened = Store::unlock(path.clone(), "secret123").expect("still readable");
+        assert_eq!(reopened.accounts.len(), 1);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn cookie_lookup_and_removal() {
+        let path = temp_path("accounts.dat");
+        let mut store = Store::create(path.clone(), "secret123", false).expect("create");
+        let id = store.add("main", "cookie-value", "");
+
+        assert_eq!(
+            store.find_by_cookie("cookie-value").map(|a| a.id.clone()),
+            Some(id.clone())
+        );
+        assert!(store.find_by_cookie("other").is_none());
+        assert!(store.find_by_cookie("").is_none());
+
+        store.remove(&id);
+        assert!(store.find(&id).is_none());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

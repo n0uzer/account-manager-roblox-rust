@@ -121,11 +121,63 @@ pub fn clean_cookie(raw: &str) -> String {
         .to_string()
 }
 
+/// Place ID from a bare number or from a game link.
+///
+/// Accepts `1818`, `https://www.roblox.com/games/1818/Name`, localized links
+/// (`/ru/games/1818/...`) and `...?placeId=1818`. Zero is never a valid place.
+pub fn parse_place_id(input: &str) -> Option<u64> {
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return text.parse().ok().filter(|id| *id > 0);
+    }
+
+    // ASCII lowercasing keeps byte offsets, so positions carry over to `text`.
+    let lowered = text.to_ascii_lowercase();
+    for marker in ["/games/", "placeid="] {
+        let Some(position) = lowered.find(marker) else {
+            continue;
+        };
+        let digits: String = text[position + marker.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if let Some(id) = digits.parse::<u64>().ok().filter(|id| *id > 0) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Why a cookie check did not produce a profile.
+///
+/// The distinction matters for the UI: a dead cookie is a fact about the
+/// account, a network hiccup says nothing about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckError {
+    /// Roblox answered and refused the cookie.
+    Dead(String),
+    /// The check itself failed (network, rate limit, unexpected answer).
+    Failed(String),
+}
+
+impl CheckError {
+    pub fn message(&self) -> &str {
+        match self {
+            CheckError::Dead(message) | CheckError::Failed(message) => message,
+        }
+    }
+}
+
+const RATE_LIMITED: &str = "Roblox просит не частить (HTTP 429): подожди минуту и повтори";
+
 /// Validate the cookie and return the account profile.
-pub fn fetch_identity(raw_cookie: &str) -> Result<Profile, String> {
+pub fn fetch_identity(raw_cookie: &str) -> Result<Profile, CheckError> {
     let cookie = clean_cookie(raw_cookie);
     if cookie.is_empty() {
-        return Err("Пустой cookie".into());
+        return Err(CheckError::Dead("Пустой cookie".into()));
     }
 
     let result = ureq::get(ME_URL)
@@ -138,9 +190,11 @@ pub fn fetch_identity(raw_cookie: &str) -> Result<Profile, String> {
         Ok(response) => {
             let identity: IdentityResponse = response
                 .into_json()
-                .map_err(|err| format!("Не разобрал ответ Roblox: {err}"))?;
+                .map_err(|err| CheckError::Failed(format!("Не разобрал ответ Roblox: {err}")))?;
             if identity.id == 0 {
-                return Err("Roblox не вернул профиль по cookie".into());
+                return Err(CheckError::Dead(
+                    "Roblox не вернул профиль по cookie".into(),
+                ));
             }
             Ok(Profile {
                 id: identity.id,
@@ -148,9 +202,14 @@ pub fn fetch_identity(raw_cookie: &str) -> Result<Profile, String> {
                 display: identity.display_name,
             })
         }
-        Err(ureq::Error::Status(401 | 403, _)) => Err("Cookie недействителен или истёк".into()),
-        Err(ureq::Error::Status(code, _)) => Err(format!("Roblox API: HTTP {code}")),
-        Err(err) => Err(format!("Нет связи с Roblox: {err}")),
+        Err(ureq::Error::Status(401 | 403, _)) => {
+            Err(CheckError::Dead("Cookie недействителен или истёк".into()))
+        }
+        Err(ureq::Error::Status(429, _)) => Err(CheckError::Failed(RATE_LIMITED.into())),
+        Err(ureq::Error::Status(code, _)) => {
+            Err(CheckError::Failed(format!("Roblox API: HTTP {code}")))
+        }
+        Err(err) => Err(CheckError::Failed(format!("Нет связи с Roblox: {err}"))),
     }
 }
 
@@ -253,6 +312,9 @@ fn ticket_for_shape(cookie: &str, body: &str, content_type: &str) -> Result<Stri
                     "HTTP {code} ({content_type}): {}",
                     summarize(&body)
                 )));
+            }
+            Err(ureq::Error::Status(429, _)) => {
+                return Err(TicketFailure::Fatal(RATE_LIMITED.into()))
             }
             Err(ureq::Error::Status(code, _)) => {
                 return Err(TicketFailure::Fatal(format!("Roblox ответил HTTP {code}")))
@@ -365,9 +427,13 @@ fn version_roots() -> Vec<PathBuf> {
 }
 
 /// Only an executable that is the player can be started with player arguments.
+///
+/// Both kinds of separators are split on by hand: `Path::file_name` does not
+/// treat `\\` as a separator off Windows, which made this check (and its test)
+/// depend on the platform.
 fn is_player(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
+    path.to_str()
+        .and_then(|text| text.rsplit(['\\', '/']).next())
         .is_some_and(|name| name.eq_ignore_ascii_case(CLIENT_EXE))
 }
 
@@ -577,6 +643,40 @@ mod tests {
             r"C:\Users\me\AppData\Local\Bloxstrap\Bloxstrap.exe"
         )));
         assert!(!is_player(Path::new(r"C:\Windows\System32\reg.exe")));
+    }
+
+    #[test]
+    fn place_id_from_number_or_link() {
+        assert_eq!(parse_place_id("1818"), Some(1818));
+        assert_eq!(parse_place_id("  1818 \n"), Some(1818));
+        assert_eq!(
+            parse_place_id("https://www.roblox.com/games/920587237/Adopt-Me"),
+            Some(920587237)
+        );
+        assert_eq!(
+            parse_place_id("https://www.roblox.com/ru/games/1818/Crossroads?x=1"),
+            Some(1818)
+        );
+        assert_eq!(
+            parse_place_id("https://www.roblox.com/Game?PlaceId=1818&foo=2"),
+            Some(1818)
+        );
+    }
+
+    #[test]
+    fn place_id_rejects_garbage_and_zero() {
+        assert_eq!(parse_place_id(""), None);
+        assert_eq!(parse_place_id("abc"), None);
+        assert_eq!(parse_place_id("0"), None);
+        assert_eq!(parse_place_id("https://www.roblox.com/games/0/x"), None);
+        assert_eq!(parse_place_id("https://example.com/"), None);
+        assert_eq!(parse_place_id("99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn check_error_exposes_its_message() {
+        assert_eq!(CheckError::Dead("x".into()).message(), "x");
+        assert_eq!(CheckError::Failed("y".into()).message(), "y");
     }
 
     #[test]
