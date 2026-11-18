@@ -15,6 +15,7 @@ mod jobs;
 mod roblox;
 mod singleton;
 mod store;
+mod throttle;
 mod ui;
 mod window;
 

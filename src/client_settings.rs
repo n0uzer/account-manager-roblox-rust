@@ -1,8 +1,15 @@
 //! Roblox client overrides: FPS cap and graphics quality.
 //!
 //! The client reads `ClientSettings/ClientAppSettings.json` from its own version
-//! folder at startup. Values there are FFlag **strings**, not numbers.
+//! folder at startup. Values there are FFlag **strings**, not numbers — that is
+//! how every tool writes them, including Bloxstrap.
 //! Roblox updates replace that folder, so the file is rewritten before each launch.
+//!
+//! Since 2026 the client applies only flags listed in
+//! `clientsettingscdn.roblox.com/v2/settings/application/PCDesktopClient`, and
+//! neither key below is on that list, so current clients ignore them. The file
+//! is still written: older clients and builds with the allowlist disabled read
+//! it, and the real load limiter is the job-object CPU cap in [`crate::throttle`].
 
 use std::fs;
 use std::path::{Path, PathBuf};

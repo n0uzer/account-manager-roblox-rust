@@ -38,9 +38,14 @@ pub struct Config {
     pub auto_lock_minutes: u32,
     pub sort: SortKey,
     /// Target FPS for the client, 0 keeps the game default.
+    ///
+    /// Written to `ClientAppSettings.json`, but current clients filter the key
+    /// out (fast-flag allowlist), so it is informational rather than effective.
     pub fps_cap: u32,
     /// Graphics quality 1..=10, 0 keeps the game default.
     pub graphics_quality: u32,
+    /// Hard CPU budget per window in percent, 0 means "no limit".
+    pub cpu_percent: u32,
     /// Client area size in `--app` mode, 0x0 keeps the default window.
     pub window_width: u32,
     pub window_height: u32,
@@ -53,9 +58,11 @@ impl Default for Config {
             multi_instance: true,
             auto_lock_minutes: 15,
             sort: SortKey::Added,
-            // 60 FPS is the sane default: Roblox renders at that rate anyway.
-            fps_cap: 60,
+            // Off by default: current clients ignore the FPS flag anyway, so a
+            // non-zero default would only produce a misleading status note.
+            fps_cap: 0,
             graphics_quality: 0,
+            cpu_percent: 0,
             window_width: 0,
             window_height: 0,
         }

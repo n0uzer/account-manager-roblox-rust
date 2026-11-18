@@ -13,6 +13,7 @@ use crate::jobs::{self, Done, Job};
 use crate::roblox::{self, CheckError};
 use crate::singleton;
 use crate::store::{self, Account, Store, MIN_PASSWORD_CHARS};
+use crate::throttle;
 
 const CLIPBOARD_TTL: Duration = Duration::from_secs(60);
 /// Gap between queued launches: Roblox dislikes a burst of ticket requests.
@@ -33,16 +34,7 @@ const COL_USER: f32 = 160.0;
 const COL_ID: f32 = 100.0;
 
 const AUTO_LOCK_CHOICES: [u32; 5] = [0, 1, 5, 15, 30];
-const FPS_CHOICES: [u32; 5] = [0, 30, 60, 120, 144];
 const QUALITY_CHOICES: [u32; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
-const SIZE_CHOICES: [(u32, u32); 6] = [
-    (0, 0),
-    (1280, 720),
-    (1024, 576),
-    (960, 540),
-    (800, 450),
-    (640, 360),
-];
 
 /// Kind of message, drives its colour.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -683,27 +675,22 @@ impl App {
 
     fn limits_row(&mut self, ui: &mut egui::Ui) {
         let multi = self.config.multi_instance;
+        let mut save = false;
+
         ui.horizontal_wrapped(|ui| {
+            // Free-form on purpose: the game accepts any number, and the old
+            // presets only got in the way.
             ui.label("FPS:");
-            let options: Vec<(u32, String)> = FPS_CHOICES
-                .iter()
-                .map(|&fps| {
-                    let text = if fps == 0 {
-                        "без лимита".to_string()
-                    } else {
-                        format!("{fps} FPS")
-                    };
-                    (fps, text)
-                })
-                .collect();
-            let (picked, response) = pick(ui, "fps-cap", self.config.fps_cap, &options, 100.0);
-            response.on_hover_text(
-                "Потолок кадров клиента (DFIntTaskSchedulerTargetFps). \
-                 Применяется при следующем запуске окна.",
+            let fps = number(ui, &mut self.config.fps_cap, 0..=1000, " FPS");
+            save |= persist_now(&fps);
+            fps.on_hover_text(
+                "Любое число кадров в секунду, 0 — без ограничения.\n\
+                 Пишется в ClientAppSettings.json как DFIntTaskSchedulerTargetFps.\n\
+                 Roblox применяет только флаги из своего allowlist, а этого ключа там \
+                 нет: актуальные клиенты значение игнорируют. Реальная мера — поле CPU.",
             );
-            if let Some(fps) = picked {
-                self.config.fps_cap = fps;
-                self.save_config();
+            if self.config.fps_cap == 0 {
+                ui.label("(без лимита)");
             }
 
             ui.label("Графика:");
@@ -731,43 +718,62 @@ impl App {
             );
             if let Some(level) = picked {
                 self.config.graphics_quality = level;
-                self.save_config();
+                save = true;
             }
 
-            ui.label("Разрешение окна:");
-            let options: Vec<((u32, u32), String)> = SIZE_CHOICES
-                .iter()
-                .map(|&(width, height)| {
-                    let text = if width == 0 {
-                        "как обычно".to_string()
-                    } else {
-                        format!("{width}×{height}")
-                    };
-                    ((width, height), text)
-                })
-                .collect();
-            let current = (self.config.window_width, self.config.window_height);
-            let picked = ui
+            let per_window = ui
                 .add_enabled_ui(multi, |ui| {
-                    let (picked, response) = pick(ui, "window-size", current, &options, 110.0);
-                    response
-                        .on_hover_text(
-                            "Меньшее окно = меньше пикселей на кадр. Размер задаётся только \
-                             для окон, которые запустил менеджер (--app).",
-                        )
-                        .on_disabled_hover_text(
-                            "Размер окна работает только при включённом режиме \
-                             «Несколько окон»: deeplink его не задаёт.",
-                        );
-                    picked
+                    let mut save = false;
+
+                    ui.label("Разрешение окна:");
+                    let width = number(ui, &mut self.config.window_width, 0..=7680, " px");
+                    save |= persist_now(&width);
+                    width.on_hover_text("Ширина клиентской области окна в пикселях.");
+
+                    ui.label("×");
+
+                    let height = number(ui, &mut self.config.window_height, 0..=4320, " px");
+                    save |= persist_now(&height);
+                    height.on_hover_text(
+                        "Высота клиентской области окна в пикселях.\n\
+                         0 в ширине или высоте — окно обычного размера.",
+                    );
+
+                    ui.label("CPU:");
+                    let cpu = number(ui, &mut self.config.cpu_percent, 0..=100, " %");
+                    save |= persist_now(&cpu);
+                    cpu.on_hover_text(
+                        "Жёсткий лимит доли процессора на одно окно, 0 — без ограничения.\n\
+                         Работает на уровне Windows (job object), клиент его не отменяет.\n\
+                         Это доля всего процессора, а не одного ядра.\n\
+                         Меньше значение — меньше FPS, но и меньше нагрузки.",
+                    );
+                    if self.config.cpu_percent > 0 {
+                        ui.label(cores_note(
+                            self.config.cpu_percent,
+                            throttle::logical_cpus(),
+                        ));
+                    }
+
+                    save
                 })
                 .inner;
-            if let Some((width, height)) = picked {
-                self.config.window_width = width;
-                self.config.window_height = height;
-                self.save_config();
+            save |= per_window;
+
+            if multi {
+                ui.label("(0 — как обычно)");
+            } else {
+                ui.label("(только для «Несколько окон»): deeplink не отдаёт нам процесс")
+                    .on_hover_text(
+                        "Размер окна и лимит CPU задаются только у клиентов, которых \
+                         запустил менеджер через --app.",
+                    );
             }
         });
+
+        if save {
+            self.save_config();
+        }
     }
 
     fn list_row(&mut self, ui: &mut egui::Ui) {
@@ -1743,6 +1749,7 @@ impl App {
         roblox::Limits {
             fps_cap: self.config.fps_cap,
             quality: self.config.graphics_quality,
+            cpu_percent: self.config.cpu_percent,
             width: self.config.window_width,
             height: self.config.window_height,
         }
@@ -2196,6 +2203,53 @@ fn auto_lock_text(minutes: u32) -> String {
     }
 }
 
+/// Numeric field for a limit: any value can be typed, so the presets are gone.
+fn number(
+    ui: &mut egui::Ui,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+    suffix: &str,
+) -> egui::Response {
+    ui.add(
+        egui::DragValue::new(value)
+            .range(range)
+            .speed(1.0)
+            .suffix(suffix),
+    )
+}
+
+/// Whether the value should be written to disk right away.
+///
+/// A drag reports `changed` on every frame, and rewriting the config 60 times a
+/// second is pointless: the file is written once, when the drag ends.
+fn persist_now(response: &egui::Response) -> bool {
+    response.changed() && (!response.dragged() || response.drag_stopped())
+}
+
+/// "0.6 ядра" / "1 ядро" / "12 ядер": how much CPU a percentage really is.
+fn cores_note(percent: u32, cpus: u32) -> String {
+    let cores = (percent as f32 / 100.0 * cpus as f32 * 10.0).round() / 10.0;
+    let whole = cores.round() as u32;
+    let is_whole = (cores - whole as f32).abs() < 0.001;
+
+    let amount = if is_whole {
+        whole.to_string()
+    } else {
+        format!("{cores:.1}")
+    };
+    let word = if !is_whole {
+        "ядра"
+    } else {
+        match (whole % 100, whole % 10) {
+            (11..=14, _) => "ядер",
+            (_, 1) => "ядро",
+            (_, 2..=4) => "ядра",
+            _ => "ядер",
+        }
+    };
+    format!("≈ {amount} {word}")
+}
+
 /// Combo box over `(value, caption)` pairs. Returns the value picked this frame.
 fn pick<T: Copy + PartialEq>(
     ui: &mut egui::Ui,
@@ -2361,5 +2415,15 @@ mod tests {
     fn auto_lock_captions() {
         assert_eq!(auto_lock_text(0), "выкл");
         assert_eq!(auto_lock_text(15), "15 мин");
+    }
+
+    #[test]
+    fn cpu_budget_is_explained_in_cores() {
+        // A share of the whole CPU, not of one core.
+        assert_eq!(cores_note(5, 12), "≈ 0.6 ядра");
+        assert_eq!(cores_note(10, 10), "≈ 1 ядро");
+        assert_eq!(cores_note(30, 10), "≈ 3 ядра");
+        assert_eq!(cores_note(100, 12), "≈ 12 ядер");
+        assert_eq!(cores_note(100, 11), "≈ 11 ядер");
     }
 }
