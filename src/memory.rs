@@ -17,7 +17,7 @@ use crate::processes;
 
 /// How often background clients are trimmed. Often enough to matter, rare
 /// enough not to fight a client that is loading a place.
-const INTERVAL: Duration = Duration::from_secs(30);
+const INTERVAL: Duration = Duration::from_secs(20);
 
 static STARTED: Once = Once::new();
 

@@ -591,8 +591,11 @@ impl App {
     }
 
     fn launch_row(&mut self, ui: &mut egui::Ui) {
-        let place_valid = self.place_id().is_some();
+        let destination = self.destination();
+        let place_valid = destination.is_some();
         let place_invalid = !self.config.place_id.trim().is_empty() && !place_valid;
+        let private_invalid = !self.config.private_link.trim().is_empty()
+            && roblox::parse_private_server(&self.config.private_link).is_none();
         let selected_label = self.selected_account().map(|account| account.label.clone());
 
         ui.horizontal_wrapped(|ui| {
@@ -620,6 +623,40 @@ impl App {
                 self.save_config();
             }
 
+            ui.label("Приватный:");
+            let private = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.config.private_link)
+                        .hint_text("ссылка на приватный сервер")
+                        .text_color_opt(private_invalid.then_some(error_color))
+                        .desired_width(240.0),
+                )
+                .on_hover_text(
+                    "Вставь ссылку на приватный сервер целиком:\n\
+                     .../games/1234/Name?privateServerLinkCode=ABC\n\
+                     .../share?code=...&type=Server\n\
+                     Пусто — обычный публичный сервер.\n\
+                     Ссылку вида /share менеджер разбирает через Roblox при запуске.",
+                );
+            if private.lost_focus() {
+                // A private-server link also carries the place id.
+                if self.place_id().is_none() {
+                    if let Some(id) = roblox::parse_place_id(&self.config.private_link) {
+                        self.config.place_id = id.to_string();
+                    }
+                }
+                self.save_config();
+            }
+            if !self.config.private_link.trim().is_empty()
+                && ui
+                    .small_button("×")
+                    .on_hover_text("Убрать приватный сервер")
+                    .clicked()
+            {
+                self.config.private_link.clear();
+                self.save_config();
+            }
+
             let launch_text = match &selected_label {
                 Some(label) => format!("Запустить «{}»", shorten(label, 18)),
                 None => "Запустить".to_string(),
@@ -634,7 +671,8 @@ impl App {
             let response = if selected_label.is_none() {
                 response.on_disabled_hover_text("Выбери аккаунт в списке")
             } else if !place_valid {
-                response.on_disabled_hover_text("Укажи Place ID или вставь ссылку на игру")
+                response
+                    .on_disabled_hover_text("Укажи Place ID или вставь ссылку на приватный сервер")
             } else {
                 response
             };
@@ -657,7 +695,8 @@ impl App {
                     "Включи «Несколько окон»: через deeplink Roblox запускает только один клиент",
                 )
             } else if !place_valid {
-                response.on_disabled_hover_text("Укажи Place ID или вставь ссылку на игру")
+                response
+                    .on_disabled_hover_text("Укажи Place ID или вставь ссылку на приватный сервер")
             } else {
                 response
             };
@@ -808,6 +847,16 @@ impl App {
                     memory::enable();
                 }
                 save = true;
+            }
+
+            if self.config.trim_memory
+                && ui
+                    .small_button("сейчас")
+                    .on_hover_text("Освободить память фоновых окон прямо сейчас")
+                    .clicked()
+            {
+                let trimmed = memory::trim_background();
+                self.info(format!("ОЗУ: освобождено у {trimmed} окон"));
             }
         });
 
@@ -978,7 +1027,7 @@ impl App {
 
             self.table_header(ui, &rows);
 
-            let place_valid = self.place_id().is_some();
+            let place_valid = self.destination().is_some();
             let mut requested: Option<(String, Action)> = None;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1708,6 +1757,12 @@ impl App {
         roblox::parse_place_id(&self.config.place_id)
     }
 
+    /// Where to launch: the typed place and the private server link, if any.
+    fn destination(&self) -> Option<roblox::Destination> {
+        let destination = roblox::destination(&self.config.place_id, &self.config.private_link);
+        destination.is_valid().then_some(destination)
+    }
+
     /// Queue a cookie check. False when there is nothing to check.
     fn start_validate(&mut self, id: &str) -> bool {
         let job = match self.store.as_ref().and_then(|store| store.find(id)) {
@@ -1755,8 +1810,8 @@ impl App {
             self.warn("Сначала выбери аккаунт");
             return;
         };
-        let Some(place_id) = self.place_id() else {
-            self.warn("Place ID должен быть числом или ссылкой на игру");
+        let Some(place) = self.destination() else {
+            self.warn("Укажи Place ID или ссылку на приватный сервер");
             return;
         };
         if account.cookie.is_empty() {
@@ -1775,7 +1830,7 @@ impl App {
         self.pending += 1;
         self.worker.send(Job::Launch {
             label: account.label.clone(),
-            place_id,
+            place,
             cookie: account.cookie.clone(),
             multi: self.config.multi_instance,
             limits: self.limits(),
@@ -1820,8 +1875,8 @@ impl App {
             self.warn(message);
             return;
         }
-        if self.place_id().is_none() {
-            self.warn("Place ID должен быть числом или ссылкой на игру");
+        if self.destination().is_none() {
+            self.warn("Укажи Place ID или ссылку на приватный сервер");
             return;
         }
 
@@ -1861,12 +1916,12 @@ impl App {
         let Some(id) = self.queue.pop_front() else {
             return;
         };
-        let Some(place_id) = self.place_id() else {
+        let Some(place) = self.destination() else {
             let dropped = self.queue.len() + 1;
             self.queue.clear();
             self.batch = None;
             self.warn(format!(
-                "Place ID стал некорректным, очередь сброшена ({dropped} не запущено)"
+                "Настройки игры стали некорректными, очередь сброшена ({dropped} не запущено)"
             ));
             return;
         };
@@ -1882,7 +1937,7 @@ impl App {
                 self.pending += 1;
                 self.worker.send(Job::Launch {
                     label: account.label.clone(),
-                    place_id,
+                    place,
                     cookie: account.cookie.clone(),
                     multi: self.config.multi_instance,
                     limits: self.limits(),

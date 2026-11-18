@@ -18,6 +18,8 @@ pub const USER_AGENT: &str = "RbxAccountManager/1.0 (local open-source tool)";
 const ME_URL: &str = "https://users.roblox.com/v1/users/authenticated";
 const TICKET_URL: &str = "https://auth.roblox.com/v1/authentication-ticket/";
 const PLACE_LAUNCHER: &str = "https://assetgame.roblox.com/game/PlaceLauncher.ashx";
+/// Resolves `/share?code=…&type=Server` links into a place and a link code.
+const SHARE_LINKS: &str = "https://apis.roblox.com/sharelinks/v1/resolve-link";
 const CLIENT_EXE: &str = "RobloxPlayerBeta.exe";
 
 /// How the game window was started.
@@ -156,6 +158,79 @@ pub fn parse_place_id(input: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Where a launch should land.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Destination {
+    /// 0 when only a share link is known; the place comes from resolving it.
+    pub place_id: u64,
+    /// Private server to join, if the user pasted a link for one.
+    pub private: Option<PrivateServer>,
+}
+
+impl Destination {
+    /// A destination is usable when it names a place or carries a server link.
+    pub fn is_valid(&self) -> bool {
+        self.place_id > 0 || self.private.is_some()
+    }
+}
+
+/// Private server reference taken from a pasted link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivateServer {
+    /// `...?privateServerLinkCode=ABC` — ready to use as is.
+    LinkCode(String),
+    /// `.../share?code=UUID&type=Server` — the code has to be resolved first.
+    ShareCode(String),
+}
+
+/// Value of `name=` in a query string, up to `&`, `#` or whitespace.
+fn query_value(input: &str, name: &str) -> Option<String> {
+    // ASCII lowercasing keeps byte offsets, so positions carry over.
+    let lowered = input.to_ascii_lowercase();
+    let marker = format!("{}=", name.to_ascii_lowercase());
+    let start = lowered.find(&marker)? + marker.len();
+    let value: String = input[start..]
+        .chars()
+        .take_while(|unit| *unit != '&' && *unit != '#' && !unit.is_whitespace())
+        .collect();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Private server from a pasted link, if the link is one.
+///
+/// Two shapes are in use: the old `?privateServerLinkCode=…` link, and the
+/// newer `/share?code=…&type=Server` link that has to be resolved through the
+/// sharelinks API (it needs the account, so that happens at launch).
+pub fn parse_private_server(input: &str) -> Option<PrivateServer> {
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Some(code) = query_value(text, "privateServerLinkCode") {
+        return Some(PrivateServer::LinkCode(code));
+    }
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("/share") && lowered.contains("type=server") {
+        if let Some(code) = query_value(text, "code") {
+            return Some(PrivateServer::ShareCode(code));
+        }
+    }
+    None
+}
+
+/// What the user asked for: a place and an optional private server link.
+///
+/// A private server link is accepted in either field: people paste it into the
+/// Place ID box as often as into its own field.
+pub fn destination(place_input: &str, private_input: &str) -> Destination {
+    Destination {
+        place_id: parse_place_id(place_input)
+            .or_else(|| parse_place_id(private_input))
+            .unwrap_or(0),
+        private: parse_private_server(private_input).or_else(|| parse_private_server(place_input)),
+    }
 }
 
 /// Why a cookie check did not produce a profile.
@@ -347,9 +422,12 @@ fn summarize(body: &str) -> String {
 }
 
 /// Build the `roblox-player:` deeplink for the system protocol handler.
-pub fn build_launch_uri(place_id: u64, ticket: &str) -> String {
+pub fn build_launch_uri(place_id: u64, private: Option<&str>, ticket: &str) -> String {
     let tracker = random_tracker();
-    let launcher = build_join_url(place_id, tracker);
+    let launcher = match private {
+        Some(code) => build_private_join_url(place_id, code, tracker),
+        None => build_join_url(place_id, tracker),
+    };
     let launched_at = now_millis();
 
     format!(
@@ -366,6 +444,77 @@ pub fn build_join_url(place_id: u64, tracker: u64) -> String {
         "{PLACE_LAUNCHER}?request=RequestGame&placeId={place_id}\
          &browserTrackerId={tracker}&isPlayTogetherGame=false"
     )
+}
+
+/// Same, but for a private server: the link code is what puts the client into
+/// the owner's server instead of a random public one.
+pub fn build_private_join_url(place_id: u64, code: &str, tracker: u64) -> String {
+    format!(
+        "{PLACE_LAUNCHER}?request=RequestPrivateGame&placeId={place_id}\
+         &privateServerLinkCode={}&browserTrackerId={tracker}",
+        urlencoding::encode(code)
+    )
+}
+
+/// Turn a `/share?code=…&type=Server` link into a place id and a link code.
+///
+/// The sharelinks endpoint needs an authenticated session, so the launching
+/// account's cookie is used — it is the same account that joins a second later.
+fn resolve_share_link(code: &str, cookie: &str) -> Result<(u64, String), String> {
+    let body = serde_json::json!({ "linkId": code, "linkType": "Server" });
+    let mut token: Option<String> = None;
+
+    for _ in 0..2 {
+        let mut request = ureq::post(SHARE_LINKS)
+            .set("User-Agent", USER_AGENT)
+            .set("Accept", "application/json")
+            .set("Cookie", &format!(".ROBLOSECURITY={cookie}"));
+        if let Some(token) = token.as_deref() {
+            request = request.set("X-CSRF-TOKEN", token);
+        }
+
+        match request.send_json(body.clone()) {
+            Ok(response) => {
+                let json: serde_json::Value = response
+                    .into_json()
+                    .map_err(|err| format!("не понял ответ Roblox про приватный сервер: {err}"))?;
+                return share_from_json(&json);
+            }
+            Err(ureq::Error::Status(_, response)) => {
+                // Roblox answers the first POST with 403 and a fresh token.
+                let next = response.header("x-csrf-token").map(str::to_string);
+                if let Some(next) = next.filter(|next| token.as_deref() != Some(next.as_str())) {
+                    token = Some(next);
+                    continue;
+                }
+                let status = response.status();
+                let body = response.into_string().unwrap_or_default();
+                return Err(format!(
+                    "Roblox не принял ссылку на приватный сервер (HTTP {status}): {}",
+                    summarize(&body)
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "не удалось разобрать ссылку на приватный сервер: {err}"
+                ))
+            }
+        }
+    }
+
+    Err("Roblox не принял ссылку на приватный сервер".into())
+}
+
+/// Pull the place and the link code out of a resolved share link.
+fn share_from_json(json: &serde_json::Value) -> Result<(u64, String), String> {
+    let data = &json["privateServerInviteData"];
+    let place_id = data["placeId"].as_u64().filter(|id| *id > 0);
+    let code = data["linkCode"].as_str().filter(|code| !code.is_empty());
+
+    match (place_id, code) {
+        (Some(place_id), Some(code)) => Ok((place_id, code.to_string())),
+        _ => Err("ссылка не ведёт на приватный сервер: возможно, он удалён".into()),
+    }
 }
 
 fn random_tracker() -> u64 {
@@ -529,14 +678,36 @@ fn spawn_new_window(
 /// rewritten before every launch. The window size is also enforced afterwards,
 /// because the client may restore its own size while loading.
 pub fn launch_game(
-    place_id: u64,
+    place: Destination,
     cookie: &str,
     multi: bool,
     limits: Limits,
 ) -> Result<LaunchOutcome, String> {
     let ticket = fetch_ticket(cookie)?;
-    let client = find_client();
     let mut notes = Vec::new();
+
+    // A share link only knows its code; the place and the link code come from
+    // Roblox itself, and that call needs the account that is about to join.
+    let mut place_id = place.place_id;
+    let private = match place.private {
+        Some(PrivateServer::LinkCode(code)) => Some(code),
+        Some(PrivateServer::ShareCode(code)) => {
+            let (resolved_place, link) = resolve_share_link(&code, cookie)?;
+            if place_id == 0 {
+                place_id = resolved_place;
+            }
+            Some(link)
+        }
+        None => None,
+    };
+    if place_id == 0 {
+        return Err("Не понял Place ID: вставь ссылку на игру или на приватный сервер".into());
+    }
+    if private.is_some() {
+        notes.push("приватный сервер".to_string());
+    }
+
+    let client = find_client();
 
     if limits.has_settings() {
         match client.as_deref() {
@@ -562,7 +733,11 @@ pub fn launch_game(
     if multi {
         let exe =
             client.ok_or_else(|| format!("Не нашёл {CLIENT_EXE}. Клиент Roblox установлен?"))?;
-        let join_url = build_join_url(place_id, random_tracker());
+        let tracker = random_tracker();
+        let join_url = match private.as_deref() {
+            Some(code) => build_private_join_url(place_id, code, tracker),
+            None => build_join_url(place_id, tracker),
+        };
         let child = spawn_new_window(&exe, &ticket, &join_url)?;
 
         if limits.has_size() {
@@ -580,7 +755,7 @@ pub fn launch_game(
         notes.push("размер окна задаётся только в режиме нескольких окон".into());
     }
 
-    let uri = build_launch_uri(place_id, &ticket);
+    let uri = build_launch_uri(place_id, private.as_deref(), &ticket);
     open::that(uri).map_err(|err| format!("Не удалось открыть клиент Roblox: {err}"))?;
     Ok(LaunchOutcome {
         kind: LaunchKind::Deeplink,
@@ -630,6 +805,79 @@ mod tests {
         assert!(limits.has_settings());
         assert!(limits.has_size());
         assert_eq!(limits.settings_note(), "FPS 60, графика 1, текстуры 1");
+    }
+
+    #[test]
+    fn private_link_code_is_recognized() {
+        let link = "https://www.roblox.com/games/1818/Crossroads?privateServerLinkCode=AbC123xyz";
+        assert_eq!(
+            parse_private_server(link),
+            Some(PrivateServer::LinkCode("AbC123xyz".into()))
+        );
+
+        // The same link also names the place.
+        let place = destination(link, "");
+        assert_eq!(place.place_id, 1818);
+        assert!(place.is_valid());
+        assert!(place.private.is_some());
+    }
+
+    #[test]
+    fn share_link_needs_resolving() {
+        let link = "https://www.roblox.com/share?code=0f1e2d3c-4b5a&type=Server";
+        assert_eq!(
+            parse_private_server(link),
+            Some(PrivateServer::ShareCode("0f1e2d3c-4b5a".into()))
+        );
+
+        // A share link carries no place id, but it is still launchable.
+        let place = destination("", link);
+        assert_eq!(place.place_id, 0);
+        assert!(place.is_valid());
+    }
+
+    #[test]
+    fn ordinary_links_are_not_private() {
+        assert_eq!(parse_private_server("1818"), None);
+        assert_eq!(
+            parse_private_server("https://www.roblox.com/games/1818/Name"),
+            None
+        );
+        assert_eq!(parse_private_server(""), None);
+        // A share link for an experience is not a server link.
+        assert_eq!(
+            parse_private_server("https://www.roblox.com/share?code=abc"),
+            None
+        );
+    }
+
+    #[test]
+    fn private_join_url_asks_for_the_private_game() {
+        let url = build_private_join_url(1818, "AbC123", 42);
+        assert!(url.starts_with(PLACE_LAUNCHER));
+        assert!(url.contains("request=RequestPrivateGame"));
+        assert!(url.contains("placeId=1818"));
+        assert!(url.contains("privateServerLinkCode=AbC123"));
+        assert!(url.contains("browserTrackerId=42"));
+    }
+
+    #[test]
+    fn deeplink_carries_the_private_launcher() {
+        let uri = build_launch_uri(1818, Some("CODE123"), "TICKET");
+        assert!(uri.contains("gameinfo:TICKET"));
+        assert!(uri.contains("RequestPrivateGame"));
+        assert!(uri.contains("CODE123"));
+    }
+
+    #[test]
+    fn share_response_gives_place_and_code() {
+        let json = serde_json::json!({
+            "privateServerInviteData": { "placeId": 1818, "linkCode": "abc" }
+        });
+        assert_eq!(share_from_json(&json), Ok((1818, "abc".to_string())));
+
+        let empty = serde_json::json!({ "privateServerInviteData": null });
+        assert!(share_from_json(&empty).is_err());
     }
 
     #[test]

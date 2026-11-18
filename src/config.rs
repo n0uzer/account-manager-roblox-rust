@@ -33,6 +33,9 @@ impl SortKey {
 #[serde(default)]
 pub struct Config {
     pub place_id: String,
+    /// Link to a private server, empty for a public one. Either the
+    /// `?privateServerLinkCode=…` form or the newer `/share?code=…&type=Server`.
+    pub private_link: String,
     pub multi_instance: bool,
     /// 0 disables the auto-lock.
     pub auto_lock_minutes: u32,
@@ -57,6 +60,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             place_id: String::new(),
+            private_link: String::new(),
             multi_instance: true,
             auto_lock_minutes: 15,
             sort: SortKey::Added,
