@@ -54,6 +54,18 @@ pub struct Config {
     /// Client area size in `--app` mode, 0x0 keeps the default window.
     pub window_width: u32,
     pub window_height: u32,
+    /// Spread the client windows over the screen in a grid after each launch.
+    pub tile_windows: bool,
+    /// Seconds between two launches of a batch. Booting six clients at once
+    /// spikes RAM and disk, so the queue is spaced out.
+    pub launch_gap_secs: u32,
+    /// Extra graphics switches from the client's allowlist.
+    pub no_grass: bool,
+    pub gray_sky: bool,
+    pub pause_voxelizer: bool,
+    pub low_csg: bool,
+    /// 0 keeps the client default, 1 disables anti-aliasing.
+    pub msaa: u32,
 }
 
 impl Default for Config {
@@ -72,6 +84,17 @@ impl Default for Config {
             trim_memory: false,
             window_width: 0,
             window_height: 0,
+            // On by default: several windows overlapping each other is the
+            // main reason to run them in the first place.
+            tile_windows: true,
+            // Two seconds is enough for the client to grab its window without
+            // six of them loading a place at the same moment.
+            launch_gap_secs: 2,
+            no_grass: false,
+            gray_sky: false,
+            pause_voxelizer: false,
+            low_csg: false,
+            msaa: 0,
         }
     }
 }

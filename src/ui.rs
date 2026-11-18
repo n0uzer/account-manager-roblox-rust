@@ -14,10 +14,11 @@ use crate::memory;
 use crate::roblox::{self, CheckError};
 use crate::singleton;
 use crate::store::{self, Account, Store, MIN_PASSWORD_CHARS};
+use crate::window;
 
 const CLIPBOARD_TTL: Duration = Duration::from_secs(60);
-/// Gap between queued launches: Roblox dislikes a burst of ticket requests.
-const LAUNCH_GAP: Duration = Duration::from_millis(1500);
+/// Bounds of the configurable gap between two launches of a batch, seconds.
+const LAUNCH_GAP_RANGE: std::ops::RangeInclusive<u32> = 0..=60;
 /// How many avatar downloads may be in flight at once.
 const MAX_AVATAR_JOBS: usize = 3;
 /// Journal length: old lines fall off the front.
@@ -176,6 +177,14 @@ struct Batch {
     failed: Vec<String>,
 }
 
+/// Server browser state: the place it was opened for and what came back.
+struct Servers {
+    place_id: u64,
+    loading: bool,
+    error: Option<String>,
+    rows: Vec<roblox::ServerInfo>,
+}
+
 pub struct App {
     path: PathBuf,
     needs_create: bool,
@@ -196,7 +205,7 @@ pub struct App {
 
     /// Accounts checked for a batch launch.
     launch_set: Vec<String>,
-    /// Batch launch queue: ids dispatched one per `LAUNCH_GAP`.
+    /// Batch launch queue: ids dispatched one per `config.launch_gap_secs`.
     queue: VecDeque<String>,
     next_launch_at: Option<Instant>,
     batch: Option<Batch>,
@@ -205,6 +214,8 @@ pub struct App {
     show_cookie: Option<String>,
     confirm_delete: Option<String>,
     transfer: Option<Transfer>,
+    /// Server browser: `Some` while its window is open.
+    servers: Option<Servers>,
 
     clipboard_value: Option<Zeroizing<String>>,
     clipboard_clear_at: Option<Instant>,
@@ -251,6 +262,7 @@ impl App {
             show_cookie: None,
             confirm_delete: None,
             transfer: None,
+            servers: None,
             clipboard_value: None,
             clipboard_clear_at: None,
             worker: jobs::Worker::spawn(),
@@ -595,7 +607,8 @@ impl App {
         let place_valid = destination.is_some();
         let place_invalid = !self.config.place_id.trim().is_empty() && !place_valid;
         let private_invalid = !self.config.private_link.trim().is_empty()
-            && roblox::parse_private_server(&self.config.private_link).is_none();
+            && roblox::parse_private_server(&self.config.private_link).is_none()
+            && roblox::parse_job_id(&self.config.private_link).is_none();
         let selected_label = self.selected_account().map(|account| account.label.clone());
 
         ui.horizontal_wrapped(|ui| {
@@ -627,14 +640,17 @@ impl App {
             let private = ui
                 .add(
                     egui::TextEdit::singleline(&mut self.config.private_link)
-                        .hint_text("ссылка на приватный сервер")
+                        .hint_text("приватный сервер или Job ID")
                         .text_color_opt(private_invalid.then_some(error_color))
                         .desired_width(240.0),
                 )
                 .on_hover_text(
-                    "Вставь ссылку на приватный сервер целиком:\n\
-                     .../games/1234/Name?privateServerLinkCode=ABC\n\
-                     .../share?code=...&type=Server\n\
+                    "Сюда можно вставить:\n\
+                     • ссылку на приватный сервер целиком:\n\
+                     \u{20}\u{20}.../games/1234/Name?privateServerLinkCode=ABC\n\
+                     \u{20}\u{20}.../share?code=...&type=Server\n\
+                     • Job ID сервера (36 символов с дефисами) или ссылку с ?gameId=...\n\
+                     \u{20}\u{20}С ним все аккаунты заходят в один и тот же сервер.\n\
                      Пусто — обычный публичный сервер.\n\
                      Ссылку вида /share менеджер разбирает через Roblox при запуске.",
                 );
@@ -655,6 +671,19 @@ impl App {
             {
                 self.config.private_link.clear();
                 self.save_config();
+            }
+
+            if ui
+                .add_enabled(place_valid, egui::Button::new("Серверы…"))
+                .on_disabled_hover_text("Сначала укажи Place ID или ссылку на игру")
+                .on_hover_text(
+                    "Показать публичные серверы игры: игроки, пинг, FPS.\n\
+                     Клик по серверу подставит его Job ID, и все аккаунты зайдут \
+                     в этот же сервер.",
+                )
+                .clicked()
+            {
+                self.open_servers();
             }
 
             let launch_text = match &selected_label {
@@ -714,6 +743,22 @@ impl App {
             {
                 self.save_config();
             }
+
+            ui.add_enabled_ui(self.config.multi_instance, |ui| {
+                ui.label("Пауза:");
+                let mut gap = self.config.launch_gap_secs;
+                let response = number(ui, &mut gap, LAUNCH_GAP_RANGE, " с");
+                if persist_now(&response) {
+                    self.config.launch_gap_secs = gap;
+                    self.save_config();
+                }
+                response.on_hover_text(
+                    "Промежуток между запусками при пакетном запуске.\n\
+                     Шесть окон, стартующих одновременно, разом грузят процессор, диск \
+                     и ОЗУ — пауза в 2–3 секунды заметно мягче.\n\
+                     0 — запускать без паузы.",
+                );
+            });
         });
     }
 
@@ -794,35 +839,80 @@ impl App {
             let per_window = ui
                 .add_enabled_ui(multi, |ui| {
                     let mut save = false;
+                    let tiled = self.config.tile_windows;
 
                     ui.label("Разрешение окна:");
-                    let width = number(ui, &mut self.config.window_width, 0..=7680, " px");
+                    let width = ui
+                        .add_enabled_ui(!tiled, |ui| {
+                            number(ui, &mut self.config.window_width, 0..=7680, " px")
+                        })
+                        .inner;
                     save |= persist_now(&width);
                     width.on_hover_text(
                         "Ширина клиентской области окна в пикселях.\n\
-                         Клиент не даёт меньше 800×600 — это его собственный минимум.\n\
+                         0 — окно обычного размера.\n\
+                         Ниже 800×600 клиент рисует только часть кадра, но окно реально \
+                         сжимается: менеджер обходит его минимальный размер.\n\
                          Пишется в настройки клиента (StartScreenSize) и удерживается \
-                         первые 90 секунд после запуска.",
+                         первые 90 секунд после запуска.\n\
+                         Не работает при включённой «Раскладке сеткой».",
                     );
 
                     ui.label("×");
 
-                    let height = number(ui, &mut self.config.window_height, 0..=4320, " px");
+                    let height = ui
+                        .add_enabled_ui(!tiled, |ui| {
+                            number(ui, &mut self.config.window_height, 0..=4320, " px")
+                        })
+                        .inner;
                     save |= persist_now(&height);
                     height.on_hover_text(
                         "Высота клиентской области окна в пикселях.\n\
                          0 в ширине или высоте — окно обычного размера.",
                     );
 
+                    ui.add_space(6.0);
+                    if ui
+                        .checkbox(&mut self.config.tile_windows, "Раскладка сеткой")
+                        .on_hover_text(
+                            "Все окна клиента раскладываются по экрану сеткой: 2 окна — рядом, \
+                             4 — 2×2, 6 — 3×2, и так далее.\n\
+                             Размер ячейки считается от рабочей области экрана (без панели \
+                             задач), поэтому окна занимают весь монитор и не перекрывают \
+                             друг друга.\n\
+                             Клиент обычно не даёт окно меньше 800×600 — менеджер обходит это \
+                             ограничение, поэтому 6 окон реально помещаются на одном экране.\n\
+                             Позиция и размер пересчитываются после каждого запуска.",
+                        )
+                        .changed()
+                    {
+                        save = true;
+                    }
+
+                    if ui
+                        .small_button("разложить сейчас")
+                        .on_hover_text("Пересчитать сетку по уже открытым окнам")
+                        .clicked()
+                    {
+                        window::arrange();
+                        self.info("Раскладываю окна…");
+                    }
+
                     save
                 })
                 .inner;
             save |= per_window;
 
-            if multi {
-                ui.label("(минимум 800×600)").on_hover_text(
-                    "Меньше 800×600 клиент не даёт: окно игры не сжимается ниже этого \
-                     размера, что бы мы ни просили.",
+            if multi && self.config.tile_windows {
+                ui.label("(сетка задаёт размер сама)").on_hover_text(
+                    "Пока включена раскладка сеткой, поля разрешения не используются: \
+                     размер окна считает менеджер.",
+                );
+            } else if multi {
+                ui.label("(окно не меньше 800×600)").on_hover_text(
+                    "Клиент не любит окна меньше 800×600: ниже этого размера он рисует \
+                     только часть кадра. Включай «Раскладку сеткой», если нужно больше \
+                     окон на одном экране.",
                 );
             } else {
                 ui.label("(только для «Несколько окон»): deeplink не отдаёт нам процесс")
@@ -858,6 +948,80 @@ impl App {
                 let trimmed = memory::trim_background();
                 self.info(format!("ОЗУ: освобождено у {trimmed} окон"));
             }
+
+            // Extra allowlisted switches. They change how the game looks, so they
+            // live behind a menu instead of on the toolbar.
+            let extras_on = self.config.no_grass
+                || self.config.gray_sky
+                || self.config.pause_voxelizer
+                || self.config.low_csg
+                || self.config.msaa > 0;
+            let extras_label = if extras_on {
+                "Ещё графика •"
+            } else {
+                "Ещё графика"
+            };
+            ui.menu_button(extras_label, |ui| {
+                ui.label(RichText::new("Всё это по умолчанию выключено").weak());
+                ui.separator();
+                let mut changed = false;
+
+                changed |= ui
+                    .checkbox(&mut self.config.no_grass, "Без травы")
+                    .on_hover_text(
+                        "FIntFRMMinGrassDistance и FIntFRMMaxGrassDistance = 0.\n\
+                         Убирает траву целиком: заметно на уличных картах, но и на \
+                         процессор, и на память легче.",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.config.gray_sky, "Серое небо")
+                    .on_hover_text(
+                        "FFlagDebugSkyGray: вместо неба рисуется ровный серый фон. \
+                         Меньше текстур на каждое окно.",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.config.pause_voxelizer, "Без вокселизации")
+                    .on_hover_text(
+                        "DFFlagDebugPauseVoxelizer: замораживает пересчёт вокселей \
+                         освещения — самая тяжёлая фоновая работа процессора.\n\
+                         Побочный эффект: тени от солнца перестают двигаться.",
+                    )
+                    .changed();
+                changed |= ui
+                    .checkbox(&mut self.config.low_csg, "Простое CSG")
+                    .on_hover_text(
+                        "Четыре DFIntCSGLevelOfDetailSwitchingDistance = 0: союзная \
+                         геометрия (постройки из объединённых частей) рисуется в \
+                         самом простом виде. Сильнее всего помогает на картах, \
+                         собранных из объединений.",
+                    )
+                    .changed();
+                ui.separator();
+                ui.label("Сглаживание:");
+                let options: Vec<(u32, String)> = vec![
+                    (0, "как в игре".to_string()),
+                    (1, "выключено".to_string()),
+                    (2, "×2".to_string()),
+                    (4, "×4".to_string()),
+                    (8, "×8".to_string()),
+                ];
+                let (picked, response) = pick(ui, "msaa", self.config.msaa, &options, 130.0);
+                response.on_hover_text(
+                    "FIntDebugForceMSAASamples: 1 выключает сглаживание совсем — \
+                     это минус нагрузка на видеокарту в каждом окне.",
+                );
+                if let Some(level) = picked {
+                    self.config.msaa = level;
+                    changed = true;
+                }
+
+                if changed {
+                    self.save_config();
+                    self.info("Настройки графики сохранены: применятся при следующем запуске");
+                }
+            });
         });
 
         if save {
@@ -1307,6 +1471,7 @@ impl App {
         self.delete_window(ctx);
         self.transfer_window(ctx);
         self.log_window(ctx);
+        self.servers_window(ctx);
     }
 
     /// Escape closes the topmost dialog.
@@ -1679,6 +1844,125 @@ impl App {
         }
     }
 
+    /// Public servers of the current place, so a Job ID can be picked by click.
+    fn servers_window(&mut self, ctx: &egui::Context) {
+        let Some(mut browser) = self.servers.take() else {
+            return;
+        };
+
+        let mut open = true;
+        let mut reload = false;
+        let mut picked: Option<(String, u32, u32)> = None;
+
+        egui::Window::new("Серверы игры")
+            .collapsible(false)
+            .open(&mut open)
+            .resizable(true)
+            .default_width(560.0)
+            .default_pos(egui::pos2(120.0, 120.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Place ID: {}", browser.place_id));
+                    if ui
+                        .add_enabled(!browser.loading, egui::Button::new("Обновить"))
+                        .on_hover_text("Roblox ограничивает частоту запросов: не части")
+                        .clicked()
+                    {
+                        reload = true;
+                    }
+                    if browser.loading {
+                        ui.spinner();
+                    }
+                });
+                ui.add_space(4.0);
+
+                if let Some(error) = &browser.error {
+                    let color = Tone::Error.color(ui);
+                    ui.colored_label(color, error);
+                    return;
+                }
+                if browser.rows.is_empty() {
+                    if !browser.loading {
+                        ui.label(RichText::new("Публичных серверов не видно.").weak());
+                    }
+                    return;
+                }
+
+                ui.label(
+                    RichText::new(
+                        "Пустые сверху. Клик по серверу подставит его Job ID — \
+                         все аккаунты зайдут в этот же сервер.",
+                    )
+                    .weak(),
+                );
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for row in &browser.rows {
+                            let label = format!(
+                                "{:>3}/{:<3}  пинг {:<4}  {:.0} FPS   {}",
+                                row.playing,
+                                row.max_players,
+                                row.ping,
+                                row.fps,
+                                &row.id[..8.min(row.id.len())]
+                            );
+                            if ui
+                                .selectable_label(false, label)
+                                .on_hover_text(format!("Job ID: {}", row.id))
+                                .clicked()
+                            {
+                                picked = Some((row.id.clone(), row.playing, row.max_players));
+                            }
+                        }
+                    });
+            });
+
+        if let Some((job_id, playing, max_players)) = picked {
+            self.config.private_link = job_id.clone();
+            self.save_config();
+            self.info(format!(
+                "Сервер {playing}/{max_players} выбран: {} — запуск пойдёт в него",
+                &job_id[..8.min(job_id.len())]
+            ));
+            open = false;
+        }
+
+        if reload {
+            browser.loading = true;
+            browser.error = None;
+            self.pending += 1;
+            self.worker.send(Job::Servers {
+                place_id: browser.place_id,
+            });
+        }
+        if open {
+            self.servers = Some(browser);
+        }
+    }
+
+    /// Open the server browser for the place typed in the toolbar.
+    fn open_servers(&mut self) {
+        let Some(place_id) = self.place_id() else {
+            self.warn("Сначала укажи Place ID или ссылку на игру");
+            return;
+        };
+        if self.servers.as_ref().is_some_and(|browser| browser.loading) {
+            return;
+        }
+        self.pending += 1;
+        self.worker.send(Job::Servers { place_id });
+        self.servers = Some(Servers {
+            place_id,
+            loading: true,
+            error: None,
+            rows: Vec::new(),
+        });
+    }
+
     // --------------------------------------------------------------- actions
     fn run_action(&mut self, action: Action) {
         match action {
@@ -1847,6 +2131,14 @@ impl App {
             texture: self.config.texture_quality,
             width: self.config.window_width,
             height: self.config.window_height,
+            extras: crate::client_settings::Extras {
+                no_grass: self.config.no_grass,
+                gray_sky: self.config.gray_sky,
+                pause_voxelizer: self.config.pause_voxelizer,
+                low_csg: self.config.low_csg,
+                msaa: self.config.msaa,
+            },
+            tile: self.config.tile_windows && self.config.multi_instance,
         }
     }
 
@@ -1902,7 +2194,7 @@ impl App {
         self.batch_check_done();
     }
 
-    /// Dispatch at most one queued account per `LAUNCH_GAP`.
+    /// Dispatch at most one queued account per launch gap.
     fn tick_queue(&mut self, ctx: &egui::Context) {
         let Some(at) = self.next_launch_at else {
             return;
@@ -1957,8 +2249,9 @@ impl App {
         }
 
         if !self.queue.is_empty() {
-            self.next_launch_at = Some(Instant::now() + LAUNCH_GAP);
-            ctx.request_repaint_after(LAUNCH_GAP);
+            let gap = launch_gap(self.config.launch_gap_secs);
+            self.next_launch_at = Some(Instant::now() + gap);
+            ctx.request_repaint_after(gap);
         }
     }
 
@@ -2141,6 +2434,35 @@ impl App {
                         self.batch_record(&label, result.map(|_| ()));
                     }
                 }
+                Done::Servers { place_id, result } => {
+                    self.pending = self.pending.saturating_sub(1);
+                    let found = match result {
+                        Ok(rows) => {
+                            let count = rows.len();
+                            Some((rows, count))
+                        }
+                        Err(err) => {
+                            if let Some(browser) =
+                                self.servers.as_mut().filter(|b| b.place_id == place_id)
+                            {
+                                browser.loading = false;
+                                browser.error = Some(err);
+                            }
+                            None
+                        }
+                    };
+
+                    if let Some((rows, count)) = found {
+                        if let Some(browser) =
+                            self.servers.as_mut().filter(|b| b.place_id == place_id)
+                        {
+                            browser.loading = false;
+                            browser.rows = rows;
+                            browser.error = None;
+                        }
+                        self.info(format!("Серверов найдено: {count}"));
+                    }
+                }
                 Done::Avatar { user_id, result } => {
                     self.avatars_loading.remove(&user_id);
                     if let Ok(image) = result {
@@ -2295,6 +2617,16 @@ fn auto_lock_text(minutes: u32) -> String {
     match minutes {
         0 => "выкл".to_string(),
         minutes => format!("{minutes} мин"),
+    }
+}
+
+/// Gap between two launches of a batch. Zero is allowed: some users want the
+/// windows up as fast as the machine manages.
+fn launch_gap(seconds: u32) -> Duration {
+    if seconds == 0 {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(u64::from(seconds))
     }
 }
 

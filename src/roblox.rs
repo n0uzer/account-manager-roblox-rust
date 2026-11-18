@@ -20,6 +20,8 @@ const TICKET_URL: &str = "https://auth.roblox.com/v1/authentication-ticket/";
 const PLACE_LAUNCHER: &str = "https://assetgame.roblox.com/game/PlaceLauncher.ashx";
 /// Resolves `/share?code=…&type=Server` links into a place and a link code.
 const SHARE_LINKS: &str = "https://apis.roblox.com/sharelinks/v1/resolve-link";
+/// Public server list of one place.
+const SERVERS_URL: &str = "https://games.roblox.com/v1/games";
 const CLIENT_EXE: &str = "RobloxPlayerBeta.exe";
 
 /// How the game window was started.
@@ -56,11 +58,16 @@ pub struct Limits {
     pub width: u32,
     /// Client area height, applied only in `--app` mode.
     pub height: u32,
+    /// Extra allowlisted switches, see [`client_settings::Extras`].
+    pub extras: client_settings::Extras,
+    /// Spread every client window over the screen in a grid instead of a fixed
+    /// size. Takes over from `width`/`height` when no explicit size is set.
+    pub tile: bool,
 }
 
 impl Limits {
     fn has_settings(self) -> bool {
-        self.fps_cap > 0 || self.quality > 0 || self.texture.is_some()
+        self.fps_cap > 0 || self.quality > 0 || self.texture.is_some() || self.extras.any()
     }
 
     fn has_size(self) -> bool {
@@ -78,6 +85,10 @@ impl Limits {
         }
         if let Some(texture) = self.texture {
             parts.push(format!("текстуры {texture}"));
+        }
+        let extras = self.extras.note();
+        if !extras.is_empty() {
+            parts.push(extras);
         }
         parts.join(", ")
     }
@@ -167,6 +178,8 @@ pub struct Destination {
     pub place_id: u64,
     /// Private server to join, if the user pasted a link for one.
     pub private: Option<PrivateServer>,
+    /// Public server (Job ID) to join, if the user pasted one.
+    pub job_id: Option<String>,
 }
 
 impl Destination {
@@ -220,16 +233,50 @@ pub fn parse_private_server(input: &str) -> Option<PrivateServer> {
     None
 }
 
+/// A Roblox server id: the `GameId`/Job ID from the server list, 36 chars with
+/// dashes (`d1e7b1e3-129e-404f-8882-d29d26c72dcd`).
+fn is_job_id(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    text.char_indices().all(|(index, unit)| {
+        if index == 8 || index == 13 || index == 18 || index == 23 {
+            unit == '-'
+        } else {
+            unit.is_ascii_hexdigit()
+        }
+    })
+}
+
+/// Job ID from a server link (`...?gameId=<uuid>`) or from a bare id.
+///
+/// A server browser, the "Join" button on a friend and `roblox.com/games/<id>?
+/// gameId=<uuid>` links all carry it; joining by Job ID puts several accounts
+/// into exactly the same server, which is the point of running them together.
+pub fn parse_job_id(input: &str) -> Option<String> {
+    let text = input.trim().trim_matches(['"', '\'']);
+    if text.is_empty() {
+        return None;
+    }
+    if is_job_id(text) {
+        return Some(text.to_ascii_lowercase());
+    }
+    let value = query_value(text, "jobId").or_else(|| query_value(text, "gameId"))?;
+    is_job_id(&value).then(|| value.to_ascii_lowercase())
+}
+
 /// What the user asked for: a place and an optional private server link.
 ///
-/// A private server link is accepted in either field: people paste it into the
-/// Place ID box as often as into its own field.
+/// A private server or server link is accepted in either field: people paste it
+/// into the Place ID box as often as into its own field.
 pub fn destination(place_input: &str, private_input: &str) -> Destination {
     Destination {
         place_id: parse_place_id(place_input)
             .or_else(|| parse_place_id(private_input))
             .unwrap_or(0),
         private: parse_private_server(private_input).or_else(|| parse_private_server(place_input)),
+        job_id: parse_job_id(private_input).or_else(|| parse_job_id(place_input)),
     }
 }
 
@@ -422,12 +469,14 @@ fn summarize(body: &str) -> String {
 }
 
 /// Build the `roblox-player:` deeplink for the system protocol handler.
-pub fn build_launch_uri(place_id: u64, private: Option<&str>, ticket: &str) -> String {
+pub fn build_launch_uri(
+    place_id: u64,
+    private: Option<&str>,
+    job_id: Option<&str>,
+    ticket: &str,
+) -> String {
     let tracker = random_tracker();
-    let launcher = match private {
-        Some(code) => build_private_join_url(place_id, code, tracker),
-        None => build_join_url(place_id, tracker),
-    };
+    let launcher = join_url_for(place_id, private, job_id, tracker);
     let launched_at = now_millis();
 
     format!(
@@ -436,6 +485,23 @@ pub fn build_launch_uri(place_id: u64, private: Option<&str>, ticket: &str) -> S
          +robloxLocale:en_us+gameLocale:en_us+channel:+LaunchExp:InApp",
         urlencoding::encode(&launcher)
     )
+}
+
+/// The PlaceLauncher URL for one destination.
+///
+/// A private server wins over a Job ID: it is the narrower request, and a link
+/// that carries both was made for that server anyway.
+pub fn join_url_for(
+    place_id: u64,
+    private: Option<&str>,
+    job_id: Option<&str>,
+    tracker: u64,
+) -> String {
+    match (private, job_id) {
+        (Some(code), _) => build_private_join_url(place_id, code, tracker),
+        (None, Some(job_id)) => build_job_join_url(place_id, job_id, tracker),
+        (None, None) => build_join_url(place_id, tracker),
+    }
 }
 
 /// URL the client asks PlaceLauncher for when joining a place.
@@ -453,6 +519,16 @@ pub fn build_private_join_url(place_id: u64, code: &str, tracker: u64) -> String
         "{PLACE_LAUNCHER}?request=RequestPrivateGame&placeId={place_id}\
          &privateServerLinkCode={}&browserTrackerId={tracker}",
         urlencoding::encode(code)
+    )
+}
+
+/// Same, but for one specific public server (Job ID): this is how several
+/// accounts end up in the same place instead of being spread by matchmaking.
+pub fn build_job_join_url(place_id: u64, job_id: &str, tracker: u64) -> String {
+    format!(
+        "{PLACE_LAUNCHER}?request=RequestGameJob&placeId={place_id}\
+         &gameId={}&browserTrackerId={tracker}&isPlayTogetherGame=false",
+        urlencoding::encode(job_id)
     )
 }
 
@@ -519,6 +595,70 @@ fn share_from_json(json: &serde_json::Value) -> Result<(u64, String), String> {
 
 fn random_tracker() -> u64 {
     rand::random::<u64>() % 9_000_000_000 + 1_000_000_000
+}
+
+/// One public server of a place, as the server browser shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerInfo {
+    /// Job ID: what `RequestGameJob` needs.
+    pub id: String,
+    pub playing: u32,
+    pub max_players: u32,
+    /// Round-trip time the server reports, milliseconds.
+    pub ping: u32,
+    pub fps: f64,
+}
+
+/// Public servers of a place, emptiest first.
+///
+/// This is how several accounts can be gathered into one server: pick the
+/// server here, then launch them all with that Job ID. Roblox rate-limits the
+/// list (HTTP 429), so a failure is reported as is instead of being retried.
+pub fn fetch_servers(place_id: u64) -> Result<Vec<ServerInfo>, String> {
+    let url = format!(
+        "{SERVERS_URL}/{place_id}/servers/Public?sortOrder=Asc&excludeFullGames=false&limit=100"
+    );
+    let response = ureq::get(&url)
+        .set("User-Agent", USER_AGENT)
+        .set("Accept", "application/json")
+        .call();
+
+    let json: serde_json::Value = match response {
+        Ok(response) => response
+            .into_json()
+            .map_err(|err| format!("не понял список серверов: {err}"))?,
+        Err(ureq::Error::Status(429, _)) => {
+            return Err("Roblox просит не частить со списком серверов: подожди минуту".into())
+        }
+        Err(ureq::Error::Status(404, _)) => return Err("У этой игры нет публичных серверов".into()),
+        Err(ureq::Error::Status(code, _)) => return Err(format!("Roblox ответил HTTP {code}")),
+        Err(err) => return Err(format!("Нет связи с Roblox: {err}")),
+    };
+
+    let mut servers: Vec<ServerInfo> = json["data"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(server_from_json).collect())
+        .unwrap_or_default();
+
+    // Emptiest first, then the lowest ping: the order in which a request to join
+    // is most likely to succeed straight away.
+    servers.sort_by(|left, right| {
+        left.playing
+            .cmp(&right.playing)
+            .then(left.ping.cmp(&right.ping))
+    });
+    Ok(servers)
+}
+
+fn server_from_json(row: &serde_json::Value) -> Option<ServerInfo> {
+    let id = row["id"].as_str().filter(|id| !id.is_empty())?;
+    Some(ServerInfo {
+        id: id.to_string(),
+        playing: row["playing"].as_u64().unwrap_or(0) as u32,
+        max_players: row["maxPlayers"].as_u64().unwrap_or(0) as u32,
+        ping: row["ping"].as_u64().unwrap_or(0) as u32,
+        fps: row["fps"].as_f64().unwrap_or(0.0),
+    })
 }
 
 /// Folders that keep the real player next to themselves.
@@ -705,6 +845,8 @@ pub fn launch_game(
     }
     if private.is_some() {
         notes.push("приватный сервер".to_string());
+    } else if let Some(job_id) = place.job_id.as_deref() {
+        notes.push(format!("сервер {}", short_job(job_id)));
     }
 
     let client = find_client();
@@ -712,7 +854,13 @@ pub fn launch_game(
     if limits.has_settings() {
         match client.as_deref() {
             Some(exe) => {
-                match client_settings::apply(exe, limits.fps_cap, limits.quality, limits.texture) {
+                match client_settings::apply(
+                    exe,
+                    limits.fps_cap,
+                    limits.quality,
+                    limits.texture,
+                    limits.extras,
+                ) {
                     Ok(Some(_)) => notes.push(limits.settings_note()),
                     Ok(None) => {}
                     Err(err) => notes.push(format!("настройки клиента не применены: {err}")),
@@ -734,13 +882,20 @@ pub fn launch_game(
         let exe =
             client.ok_or_else(|| format!("Не нашёл {CLIENT_EXE}. Клиент Roblox установлен?"))?;
         let tracker = random_tracker();
-        let join_url = match private.as_deref() {
-            Some(code) => build_private_join_url(place_id, code, tracker),
-            None => build_join_url(place_id, tracker),
-        };
+        let join_url = join_url_for(
+            place_id,
+            private.as_deref(),
+            place.job_id.as_deref(),
+            tracker,
+        );
         let child = spawn_new_window(&exe, &ticket, &join_url)?;
 
-        if limits.has_size() {
+        if limits.tile {
+            // The grid decides both the position and the size: it recomputes
+            // itself as more windows appear.
+            window::arrange();
+            notes.push("раскладка сеткой".to_string());
+        } else if limits.has_size() {
             window::resize_when_ready(child.id(), limits.width, limits.height);
             notes.push(format!("окно {}×{}", limits.width, limits.height));
         }
@@ -755,12 +910,22 @@ pub fn launch_game(
         notes.push("размер окна задаётся только в режиме нескольких окон".into());
     }
 
-    let uri = build_launch_uri(place_id, private.as_deref(), &ticket);
+    let uri = build_launch_uri(
+        place_id,
+        private.as_deref(),
+        place.job_id.as_deref(),
+        &ticket,
+    );
     open::that(uri).map_err(|err| format!("Не удалось открыть клиент Roblox: {err}"))?;
     Ok(LaunchOutcome {
         kind: LaunchKind::Deeplink,
         notes,
     })
+}
+
+/// First eight characters of a Job ID, enough to tell two servers apart.
+fn short_job(job_id: &str) -> String {
+    job_id.chars().take(8).collect()
 }
 
 #[cfg(test)]
@@ -801,10 +966,18 @@ mod tests {
             texture: Some(1),
             width: 960,
             height: 540,
+            extras: crate::client_settings::Extras {
+                no_grass: true,
+                ..crate::client_settings::Extras::default()
+            },
+            tile: false,
         };
         assert!(limits.has_settings());
         assert!(limits.has_size());
-        assert_eq!(limits.settings_note(), "FPS 60, графика 1, текстуры 1");
+        assert_eq!(
+            limits.settings_note(),
+            "FPS 60, графика 1, текстуры 1, без травы"
+        );
     }
 
     #[test]
@@ -863,10 +1036,81 @@ mod tests {
 
     #[test]
     fn deeplink_carries_the_private_launcher() {
-        let uri = build_launch_uri(1818, Some("CODE123"), "TICKET");
+        let uri = build_launch_uri(1818, Some("CODE123"), None, "TICKET");
         assert!(uri.contains("gameinfo:TICKET"));
         assert!(uri.contains("RequestPrivateGame"));
         assert!(uri.contains("CODE123"));
+    }
+
+    #[test]
+    fn deeplink_carries_the_job_id() {
+        let job = "d1e7b1e3-129e-404f-8882-d29d26c72dcd";
+        let uri = build_launch_uri(1818, None, Some(job), "TICKET");
+        assert!(uri.contains("RequestGameJob"));
+        assert!(uri.contains(job));
+
+        // A private server wins over a Job ID when both are somehow present.
+        let both = join_url_for(1818, Some("CODE123"), Some(job), 42);
+        assert!(both.contains("RequestPrivateGame"));
+        assert!(!both.contains("RequestGameJob"));
+    }
+
+    #[test]
+    fn job_id_is_recognized_in_both_shapes() {
+        let job = "d1e7b1e3-129e-404f-8882-d29d26c72dcd";
+        assert_eq!(parse_job_id(job), Some(job.to_string()));
+
+        // Upper case is fine; the launcher expects lower case.
+        assert_eq!(
+            parse_job_id("D1E7B1E3-129E-404F-8882-D29D26C72DCD"),
+            Some(job.to_string())
+        );
+
+        let link = format!("https://www.roblox.com/games/1818/Name?gameId={job}");
+        assert_eq!(parse_job_id(&link), Some(job.to_string()));
+        assert_eq!(destination(&link, "").job_id, Some(job.to_string()));
+        assert_eq!(destination("1818", job).job_id, Some(job.to_string()));
+
+        // Ordinary links and ids are not servers.
+        assert_eq!(parse_job_id("https://www.roblox.com/games/1818/Name"), None);
+        assert_eq!(parse_job_id("1818"), None);
+        assert_eq!(parse_job_id(""), None);
+        // A private server link is not a Job ID either.
+        assert_eq!(
+            parse_job_id("https://www.roblox.com/games/1/N?privateServerLinkCode=abc"),
+            None
+        );
+    }
+
+    #[test]
+    fn server_row_is_read_from_the_api_answer() {
+        let row = serde_json::json!({
+            "id": "d1e7b1e3-129e-404f-8882-d29d26c72dcd",
+            "playing": 7,
+            "maxPlayers": 15,
+            "ping": 131,
+            "fps": 59.97
+        });
+        let server = server_from_json(&row).expect("server");
+        assert_eq!(server.id, "d1e7b1e3-129e-404f-8882-d29d26c72dcd");
+        assert_eq!(server.playing, 7);
+        assert_eq!(server.max_players, 15);
+        assert_eq!(server.ping, 131);
+        assert!((server.fps - 59.97).abs() < 0.01);
+
+        // A row without an id is not a server.
+        assert!(server_from_json(&serde_json::json!({ "playing": 1 })).is_none());
+    }
+
+    #[test]
+    fn job_join_url_asks_for_that_server() {
+        let job = "d1e7b1e3-129e-404f-8882-d29d26c72dcd";
+        let url = build_job_join_url(1818, job, 42);
+        assert!(url.starts_with(PLACE_LAUNCHER));
+        assert!(url.contains("request=RequestGameJob"));
+        assert!(url.contains("placeId=1818"));
+        assert!(url.contains(&format!("gameId={job}")));
+        assert!(url.contains("browserTrackerId=42"));
     }
 
     #[test]

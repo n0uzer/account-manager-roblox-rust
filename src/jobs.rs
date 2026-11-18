@@ -23,6 +23,9 @@ pub enum Job {
     Avatar {
         user_id: u64,
     },
+    Servers {
+        place_id: u64,
+    },
 }
 
 pub enum Done {
@@ -38,6 +41,10 @@ pub enum Done {
     Avatar {
         user_id: u64,
         result: Result<AvatarImage, String>,
+    },
+    Servers {
+        place_id: u64,
+        result: Result<Vec<roblox::ServerInfo>, String>,
     },
 }
 
@@ -76,6 +83,10 @@ impl Worker {
                         Job::Avatar { user_id } => Done::Avatar {
                             user_id,
                             result: avatar::load(user_id),
+                        },
+                        Job::Servers { place_id } => Done::Servers {
+                            place_id,
+                            result: roblox::fetch_servers(place_id),
                         },
                     };
 
