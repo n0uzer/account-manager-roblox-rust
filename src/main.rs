@@ -13,6 +13,7 @@ mod crypto;
 mod dpapi;
 mod jobs;
 mod roblox;
+mod singleton;
 mod store;
 mod ui;
 mod window;

@@ -152,15 +152,28 @@ Cookie: .ROBLOSECURITY=...
      `roblox-player:1+launchmode:play+gameinfo:<ticket>+...` и открывается системным
      обработчиком протокола. Второй клиент Roblox уже не запустится;
    - **несколько окон** (галочка стоит, по умолчанию) — запускается
-     `RobloxPlayerBeta.exe --app -t <ticket> -j <join url>`.
-     Флаг `--app` обходит проверку единственного экземпляра, поэтому каждый запуск
-     даёт новое окно.
+     `RobloxPlayerBeta.exe --app -t <ticket> -j <join url>`, а менеджер заранее
+     занимает имена singleton-защиты клиента (см. ниже). Каждый запуск даёт новое окно.
 
 Клиент Roblox должен быть установлен. Аккаунт, под которым ты залогинен в браузере,
 на запуск не влияет — тикет привязан к конкретной cookie.
 
 ### Несколько окон: детали
 
+- Сам по себе `--app` в актуальных клиентах уже не спасает: Roblox держит
+  singleton-защиту в именованных объектах `ROBLOX_singletonEvent` и
+  `ROBLOX_singletonMutex`. Клиент, который находит такое имя занятым, просит
+  запущенное окно закрыться и занимает его место — именно поэтому новое окно
+  закрывало предыдущее.
+- Менеджер занимает оба имени **мьютексами** в своём процессе. Тогда
+  `CreateEvent` в клиенте падает с `ERROR_INVALID_HANDLE`, клиент пишет в свой лог
+  «cannot create event to secure single process» и продолжает работу без защиты —
+  поэтому все окна живут одновременно.
+- Имена держатся всё время работы менеджера, так что первый клиент должен
+  запускаться после него. Если Roblox был открыт раньше, менеджер предупредит и
+  попросит один раз закрыть окна.
+- В клиент ничего не внедряется, память не патчится, файлы игры не меняются:
+  клиент просто видит занятое имя.
 - Путь к клиенту ищется так: реестр
   `HKCU\Software\Classes\roblox-player\shell\open\command` принимается, только если
   там действительно `RobloxPlayerBeta.exe`; иначе берётся самый свежий
@@ -349,6 +362,7 @@ roblox-account-manager-rs/
     ├── config.rs    plain JSON settings (place id, sort, auto-lock, limits)
     ├── roblox.rs    cookie check, ticket, client lookup, launch (deeplink / --app)
     ├── client_settings.rs  FPS / quality overrides in ClientAppSettings.json
+    ├── singleton.rs kernel32 FFI: claim the client's single-instance names
     ├── window.rs    user32 FFI: resize the window of the client we spawned
     ├── avatar.rs    headshot download, PNG decode, disk cache
     ├── jobs.rs      background worker thread (validate / launch / avatar)
@@ -371,8 +385,8 @@ cargo clippy --all-targets
 хранилище (создание/переоткрытие, слияние дубликатов, чтение экспорта, длина пароля в
 символах, отказ перезаписать существующий файл), разбор Place ID из ссылки,
 валидацию аватарок и слияние клиентских настроек (строковые значения, сохранение
-чужих ключей, удаление лимитов при нуле). Сетевых и Win32-тестов нет: они трогали бы
-живые аккаунты и окна.
+чужих ключей, удаление лимитов при нуле), а также занятие singleton-имён клиента.
+Сетевых тестов нет: они трогали бы живые аккаунты.
 
 GitHub Actions на `windows-latest` прогоняет fmt, clippy, тесты и release-сборку
 на каждый push в `main`.

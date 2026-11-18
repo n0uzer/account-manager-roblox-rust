@@ -11,6 +11,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::config::{Config, SortKey};
 use crate::jobs::{self, Done, Job};
 use crate::roblox::{self, CheckError};
+use crate::singleton;
 use crate::store::{self, Account, Store, MIN_PASSWORD_CHARS};
 
 const CLIPBOARD_TTL: Duration = Duration::from_secs(60);
@@ -231,11 +232,12 @@ impl App {
     pub fn new() -> Self {
         let path = Store::default_path();
         let needs_create = !Store::exists(&path);
-        App {
+        let config = Config::load();
+        let mut app = App {
             path,
             needs_create,
             store: None,
-            config: Config::load(),
+            config,
             password: String::new(),
             password_repeat: String::new(),
             reveal_password: false,
@@ -266,7 +268,17 @@ impl App {
             checks: HashMap::new(),
             pending: 0,
             last_activity: Instant::now(),
+        };
+
+        // Claim the client's single-instance names before any launch, so that
+        // extra windows are not closed by the client itself.
+        if app.config.multi_instance {
+            if let Err(message) = singleton::enable() {
+                app.warn(message);
+            }
         }
+
+        app
     }
 
     // ---------------------------------------------------------------- status
@@ -1706,6 +1718,13 @@ impl App {
             return;
         }
 
+        if self.config.multi_instance {
+            if let Err(message) = singleton::enable() {
+                self.warn(message);
+                return;
+            }
+        }
+
         self.save_config();
         self.pending += 1;
         self.worker.send(Job::Launch {
@@ -1748,6 +1767,10 @@ impl App {
         }
         if !self.config.multi_instance {
             self.warn("Для запуска нескольких аккаунтов включи «Несколько окон»");
+            return;
+        }
+        if let Err(message) = singleton::enable() {
+            self.warn(message);
             return;
         }
         if self.place_id().is_none() {
