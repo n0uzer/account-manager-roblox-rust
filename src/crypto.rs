@@ -12,6 +12,7 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 pub const MAGIC: &[u8; 4] = b"RBM1";
 pub const MAGIC_DPAPI: &[u8; 4] = b"RBMD";
@@ -59,7 +60,8 @@ pub fn encrypt(
 }
 
 /// Plaintext plus everything needed to re-encrypt the file later.
-pub type Decrypted = (Vec<u8>, [u8; SALT_LEN], [u8; KEY_LEN]);
+/// The plaintext holds every cookie, so it is wiped when dropped.
+pub type Decrypted = (Zeroizing<Vec<u8>>, [u8; SALT_LEN], [u8; KEY_LEN]);
 
 /// Decrypt the file. Returns (plaintext, salt, key).
 pub fn decrypt(password: &str, blob: &[u8]) -> Result<Decrypted, String> {
@@ -84,7 +86,7 @@ pub fn decrypt(password: &str, blob: &[u8]) -> Result<Decrypted, String> {
         .decrypt(Nonce::from_slice(&nonce), &blob[header..])
         .map_err(|_| "Неверный пароль (или файл повреждён)".to_string())?;
 
-    Ok((plaintext, salt, key))
+    Ok((Zeroizing::new(plaintext), salt, key))
 }
 
 /// Add the DPAPI layer, binding the file to the current Windows user.
@@ -119,7 +121,7 @@ mod tests {
         assert_eq!(&blob[..4], MAGIC);
 
         let (plaintext, salt2, key2) = decrypt("correct horse", &blob).unwrap();
-        assert_eq!(plaintext, b"secret payload");
+        assert_eq!(&plaintext[..], b"secret payload");
         assert_eq!(salt, salt2);
         assert_eq!(key, key2);
     }

@@ -66,6 +66,7 @@ mod win {
     const GWL_EXSTYLE: i32 = -20;
     const WS_CAPTION: u32 = 0x00C0_0000;
     const SW_RESTORE: i32 = 9;
+    const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_FRAMECHANGED: u32 = 0x0020;
@@ -147,7 +148,9 @@ mod win {
                 rect.bottom = height as i32;
             }
 
-            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED;
+            // SWP_NOMOVE: only the size is ours to change. Forcing (0, 0) piled
+            // every window we resized onto the same top-left corner.
+            let flags = SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED;
             SetWindowPos(
                 hwnd,
                 std::ptr::null_mut(),
