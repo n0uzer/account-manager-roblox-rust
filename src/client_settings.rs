@@ -6,10 +6,10 @@
 //! Roblox updates replace that folder, so the file is rewritten before each launch.
 //!
 //! Since 2026 the client filters its own overrides through a fast-flag
-//! allowlist. The FPS key is dropped — the client logs
+//! allowlist. The classic FPS key is dropped — the client logs
 //! `Denied local configuration for: DFIntTaskSchedulerTargetFps` — while the
-//! quality key is accepted. The FPS value is still written for older clients
-//! and for builds without the allowlist.
+//! quality key and the Frame Rate Manager frame budget are accepted. All three
+//! are written: the classic key still works on older clients.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,17 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 pub const FPS_KEY: &str = "DFIntTaskSchedulerTargetFps";
+/// Frame Rate Manager: target frame time in milliseconds. This one is on the
+/// client's fast-flag allowlist, so current clients apply it — unlike
+/// [`FPS_KEY`], which they deny.
+pub const FRAME_TIME_KEY: &str = "DFIntFRMConstantFrameTimeTargetMs";
 pub const QUALITY_KEY: &str = "DFIntDebugFRMQualityLevelOverride";
+
+/// Frame budget for a target FPS, rounded to the nearest millisecond. 30 fps
+/// becomes 33 ms, 60 fps becomes 17 ms.
+fn frame_time_ms(fps: u32) -> u32 {
+    ((1000 + fps / 2) / fps).max(1)
+}
 
 /// Merge our overrides into the existing settings, keeping foreign keys intact.
 /// A zero value removes the key, so "off" really means "game default".
@@ -29,8 +39,13 @@ pub fn merge(existing: Option<&Value>, fps: u32, quality: u32) -> Map<String, Va
 
     if fps > 0 {
         map.insert(FPS_KEY.to_string(), Value::String(fps.to_string()));
+        map.insert(
+            FRAME_TIME_KEY.to_string(),
+            Value::String(frame_time_ms(fps).to_string()),
+        );
     } else {
         map.remove(FPS_KEY);
+        map.remove(FRAME_TIME_KEY);
     }
 
     if quality > 0 {
@@ -80,7 +95,19 @@ mod tests {
     fn writes_limits_as_strings() {
         let merged = merge(None, 60, 3);
         assert_eq!(text(&merged, FPS_KEY).as_deref(), Some("60"));
+        assert_eq!(text(&merged, FRAME_TIME_KEY).as_deref(), Some("17"));
         assert_eq!(text(&merged, QUALITY_KEY).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn fps_becomes_a_frame_budget() {
+        // The allowlisted key is a frame time, not a frame rate.
+        assert_eq!(frame_time_ms(30), 33);
+        assert_eq!(frame_time_ms(60), 17);
+        assert_eq!(frame_time_ms(20), 50);
+        assert_eq!(frame_time_ms(144), 7);
+        assert_eq!(frame_time_ms(1), 1000);
+        assert_eq!(frame_time_ms(1000), 1);
     }
 
     #[test]
@@ -95,7 +122,7 @@ mod tests {
 
     #[test]
     fn zero_removes_previous_limits() {
-        let existing = serde_json::json!({ FPS_KEY: "30", QUALITY_KEY: "1" });
+        let existing = serde_json::json!({ FPS_KEY: "30", FRAME_TIME_KEY: "33", QUALITY_KEY: "1" });
         let merged = merge(Some(&existing), 0, 0);
         assert!(merged.is_empty());
     }

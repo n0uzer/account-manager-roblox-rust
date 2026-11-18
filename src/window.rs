@@ -39,22 +39,22 @@ pub fn resize_when_ready(pid: u32, width: u32, height: u32) {
 fn pin(pid: u32, width: u32, height: u32) {
     let deadline = Instant::now() + PIN_FOR;
     while Instant::now() < deadline {
-        // The client may replace its window while loading, so the handle is
-        // looked up again on every pass instead of being remembered.
-        match win::find(pid) {
-            Some(hwnd) if win::client_size(hwnd) != (width as i32, height as i32) => {
-                win::resize(hwnd, width, height);
-            }
-            // Already right, or not created yet.
-            _ => std::thread::sleep(PIN_POLL),
-        }
+        // Every visible window of the process is checked, not just the first
+        // one: the client replaces its login box with the real game window
+        // while the place loads, and that one starts at the saved size.
+        let fixed = win::resize_all(pid, width, height);
+        // Give the client time to react to WM_SIZE before the next pass.
+        std::thread::sleep(if fixed > 0 {
+            Duration::from_millis(250)
+        } else {
+            PIN_POLL
+        });
     }
 }
 
 #[cfg(windows)]
 mod win {
     use std::ffi::c_void;
-    use std::time::Duration;
 
     type Hwnd = *mut c_void;
 
@@ -96,21 +96,23 @@ mod win {
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_FRAMECHANGED: u32 = 0x0020;
 
-    struct Search {
+    struct Pass {
         pid: u32,
-        found: Hwnd,
+        width: u32,
+        height: u32,
+        fixed: usize,
     }
 
     extern "system" fn visit(hwnd: Hwnd, lparam: isize) -> i32 {
-        // SAFETY: `lparam` points to a `Search` alive for the whole enumeration.
-        let search = unsafe { &mut *(lparam as *mut Search) };
+        // SAFETY: `lparam` points to a `Pass` alive for the whole enumeration.
+        let pass = unsafe { &mut *(lparam as *mut Pass) };
 
         let mut pid = 0u32;
         // SAFETY: `hwnd` is a window handle provided by EnumWindows.
         unsafe {
             GetWindowThreadProcessId(hwnd, &mut pid);
         }
-        if pid != search.pid || unsafe { IsWindowVisible(hwnd) } == 0 {
+        if pid != pass.pid || unsafe { IsWindowVisible(hwnd) } == 0 {
             return 1;
         }
 
@@ -120,32 +122,40 @@ mod win {
         if style & WS_CAPTION == 0 || unsafe { GetWindowTextLengthW(hwnd) } == 0 {
             return 1;
         }
+        if client_size(hwnd) == (pass.width as i32, pass.height as i32) {
+            return 1;
+        }
 
-        search.found = hwnd;
-        0 // stop the enumeration
+        resize(hwnd, pass.width, pass.height);
+        pass.fixed += 1;
+        1 // keep going: the process may own more than one window
     }
 
-    pub(super) fn find(pid: u32) -> Option<Hwnd> {
-        let mut search = Search {
+    /// Bring every visible window of `pid` to the requested client area.
+    /// Returns how many windows were touched.
+    pub(super) fn resize_all(pid: u32, width: u32, height: u32) -> usize {
+        let mut pass = Pass {
             pid,
-            found: std::ptr::null_mut(),
+            width,
+            height,
+            fixed: 0,
         };
-        // SAFETY: the callback only writes into `search`, which outlives the call.
+        // SAFETY: the callback only writes into `pass`, which outlives the call.
         unsafe {
-            EnumWindows(visit, &mut search as *mut Search as isize);
+            EnumWindows(visit, &mut pass as *mut Pass as isize);
         }
-        (!search.found.is_null()).then_some(search.found)
+        pass.fixed
     }
 
     /// Size of the drawable area, i.e. what the user actually sees.
-    pub(super) fn client_size(hwnd: Hwnd) -> (i32, i32) {
+    fn client_size(hwnd: Hwnd) -> (i32, i32) {
         let mut rect = Rect {
             left: 0,
             top: 0,
             right: 0,
             bottom: 0,
         };
-        // SAFETY: `hwnd` came from `find` and is still alive.
+        // SAFETY: `hwnd` came from `EnumWindows` in the same pass.
         unsafe {
             GetClientRect(hwnd, &mut rect);
         }
@@ -153,8 +163,8 @@ mod win {
     }
 
     /// `SetWindowPos` takes the outer size, clients count the inner one.
-    pub(super) fn resize(hwnd: Hwnd, width: u32, height: u32) {
-        // SAFETY: `hwnd` came from a successful search and is still alive.
+    fn resize(hwnd: Hwnd, width: u32, height: u32) {
+        // SAFETY: `hwnd` came from `EnumWindows` in the same pass.
         unsafe {
             // A maximized or minimized window ignores SetWindowPos.
             ShowWindow(hwnd, SW_RESTORE);
@@ -185,23 +195,13 @@ mod win {
                 rect.bottom - rect.top,
                 flags,
             );
-
-            // The client reacts to WM_SIZE asynchronously; a short pause keeps
-            // the loop from firing dozens of resizes at one window.
-            std::thread::sleep(Duration::from_millis(150));
         }
     }
 }
 
 #[cfg(not(windows))]
 mod win {
-    pub(super) fn find(_pid: u32) -> Option<()> {
-        None
+    pub(super) fn resize_all(_pid: u32, _width: u32, _height: u32) -> usize {
+        0
     }
-
-    pub(super) fn client_size(_window: ()) -> (i32, i32) {
-        (0, 0)
-    }
-
-    pub(super) fn resize(_window: (), _width: u32, _height: u32) {}
 }

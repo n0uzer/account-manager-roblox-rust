@@ -684,10 +684,10 @@ impl App {
             save |= persist_now(&fps);
             fps.on_hover_text(
                 "Любое число кадров в секунду, 0 — без ограничения.\n\
-                 Пишется в ClientAppSettings.json как DFIntTaskSchedulerTargetFps.\n\
-                 Актуальный клиент этот ключ отклоняет: в его логе появляется\n\
-                 «Denied local configuration for: DFIntTaskSchedulerTargetFps».\n\
-                 Значение остаётся для старых клиентов и сборок без allowlist.",
+                 Пишутся два ключа: DFIntFRMConstantFrameTimeTargetMs (бюджет кадра \
+                 в миллисекундах, актуальный клиент его применяет) и \
+                 DFIntTaskSchedulerTargetFps (для старых клиентов).\n\
+                 Проверить: Esc → Настройки → Производительность.",
             );
             if self.config.fps_cap == 0 {
                 ui.label("(без лимита)");

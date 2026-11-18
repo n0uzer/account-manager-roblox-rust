@@ -65,8 +65,7 @@ impl Limits {
     fn settings_note(self) -> String {
         let mut parts = Vec::new();
         if self.fps_cap > 0 {
-            // Honest on purpose: the client filters unknown fast flags out.
-            parts.push(format!("FPS ≤ {} (клиент игнорирует)", self.fps_cap));
+            parts.push(format!("FPS {}", self.fps_cap));
         }
         if self.quality > 0 {
             parts.push(format!("графика {}", self.quality));
@@ -610,10 +609,7 @@ mod tests {
         };
         assert!(limits.has_settings());
         assert!(limits.has_size());
-        assert_eq!(
-            limits.settings_note(),
-            "FPS ≤ 60 (клиент игнорирует), графика 1"
-        );
+        assert_eq!(limits.settings_note(), "FPS 60, графика 1");
     }
 
     #[test]
