@@ -70,6 +70,16 @@ fn pin(pid: u32, width: u32, height: u32) {
     }
 }
 
+/// Set every client window to `width`x`height` (client area) once, wait a moment
+/// and report the client area each window has afterwards.
+///
+/// Unlike [`resize_when_ready`] this is a single pass on windows that already
+/// exist. The answer shows whether the client accepted a size below its own
+/// minimum or put the old size back. Blocks for a fraction of a second.
+pub fn apply_size_now(width: u32, height: u32) -> Vec<(u32, u32)> {
+    win::apply_size_now(width, height)
+}
+
 /// Handles (as plain integers) of the game window of every client process.
 /// Used by anti-AFK, which has to address each window.
 pub fn game_window_handles() -> Vec<isize> {
@@ -345,6 +355,26 @@ mod win {
             .collect()
     }
 
+    pub(super) fn apply_size_now(width: u32, height: u32) -> Vec<(u32, u32)> {
+        if width == 0 || height == 0 {
+            return Vec::new();
+        }
+        let windows = game_windows();
+        for found in &windows {
+            resize(found.hwnd, width, height, None);
+        }
+        // The client reacts to a resize on its own thread; read the result after
+        // it had time to put the old size back, if it is going to.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        windows
+            .iter()
+            .map(|found| {
+                let (w, h) = client_size(found.hwnd);
+                (w.max(0) as u32, h.max(0) as u32)
+            })
+            .collect()
+    }
+
     /// Arrange every visible client window in a grid over the work area.
     pub(super) fn tile_all() {
         let mut windows = game_windows();
@@ -475,6 +505,10 @@ mod win {
     pub(super) fn tile_all() {}
 
     pub(super) fn game_window_handles() -> Vec<isize> {
+        Vec::new()
+    }
+
+    pub(super) fn apply_size_now(_width: u32, _height: u32) -> Vec<(u32, u32)> {
         Vec::new()
     }
 }
