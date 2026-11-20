@@ -6,19 +6,26 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod antiafk;
+mod autostart;
 mod avatar;
+mod backup;
 mod client_settings;
 mod config;
 mod crypto;
 mod dpapi;
 mod game_settings;
+mod import;
 mod jobs;
+mod lookup;
 mod memory;
+mod presets;
 mod processes;
 mod roblox;
 mod singleton;
 mod store;
 mod ui;
+mod watch;
 mod window;
 
 fn main() -> Result<(), eframe::Error> {
@@ -33,6 +40,10 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "RbxAccountManager",
         options,
-        Box::new(|_cc| Ok(Box::new(ui::App::new()))),
+        Box::new(|cc| {
+            let app = ui::App::new();
+            app.apply_theme(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     )
 }

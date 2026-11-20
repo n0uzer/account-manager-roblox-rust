@@ -70,6 +70,12 @@ fn pin(pid: u32, width: u32, height: u32) {
     }
 }
 
+/// Handles (as plain integers) of the game window of every client process.
+/// Used by anti-AFK, which has to address each window.
+pub fn game_window_handles() -> Vec<isize> {
+    win::game_window_handles()
+}
+
 /// Deadline shared by every caller of [`arrange`].
 static TILE_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// Set once so the layout thread is started only one time.
@@ -298,8 +304,8 @@ mod win {
         (best.1, best.0)
     }
 
-    /// Arrange every visible client window in a grid over the work area.
-    pub(super) fn tile_all() {
+    /// The game window of every client process: one per process, the largest.
+    fn game_windows() -> Vec<Found> {
         let mut list = Collect { found: Vec::new() };
         // SAFETY: the callback only writes into `list`, which outlives the call.
         unsafe {
@@ -329,8 +335,19 @@ mod win {
                 }
             }
         }
+        best.into_values().map(|(_, found)| found).collect()
+    }
 
-        let mut windows: Vec<Found> = best.into_values().map(|(_, found)| found).collect();
+    pub(super) fn game_window_handles() -> Vec<isize> {
+        game_windows()
+            .into_iter()
+            .map(|found| found.hwnd as isize)
+            .collect()
+    }
+
+    /// Arrange every visible client window in a grid over the work area.
+    pub(super) fn tile_all() {
+        let mut windows = game_windows();
         if windows.is_empty() {
             return;
         }
@@ -456,4 +473,8 @@ mod win {
     }
 
     pub(super) fn tile_all() {}
+
+    pub(super) fn game_window_handles() -> Vec<isize> {
+        Vec::new()
+    }
 }

@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::client_settings;
 use crate::game_settings;
+use crate::processes;
 use crate::window;
 
 pub const USER_AGENT: &str = "RbxAccountManager/1.0 (local open-source tool)";
@@ -98,6 +99,9 @@ impl Limits {
 pub struct LaunchOutcome {
     pub kind: LaunchKind,
     pub notes: Vec<String>,
+    /// FILETIME ticks taken just before the client was started: only processes
+    /// created after this can be the window of this launch.
+    pub launched_at: u64,
 }
 
 impl LaunchOutcome {
@@ -278,6 +282,33 @@ pub fn destination(place_input: &str, private_input: &str) -> Destination {
         private: parse_private_server(private_input).or_else(|| parse_private_server(place_input)),
         job_id: parse_job_id(private_input).or_else(|| parse_job_id(place_input)),
     }
+}
+
+/// Where one account should launch.
+///
+/// An account's own game and server win over the toolbar's. An account that
+/// names its own game but no server does *not* inherit the toolbar's server:
+/// that server belongs to a different game.
+pub fn destination_for_account(
+    own_place: &str,
+    own_server: &str,
+    toolbar_place: &str,
+    toolbar_server: &str,
+) -> Destination {
+    let (own_place, own_server) = (own_place.trim(), own_server.trim());
+    let place = if own_place.is_empty() {
+        toolbar_place
+    } else {
+        own_place
+    };
+    let server = if !own_server.is_empty() {
+        own_server
+    } else if own_place.is_empty() {
+        toolbar_server
+    } else {
+        ""
+    };
+    destination(place, server)
 }
 
 /// Why a cookie check did not produce a profile.
@@ -752,7 +783,7 @@ fn client_from_registry() -> Option<PathBuf> {
 }
 
 /// Run a console command without flashing a console window.
-fn run_hidden(command: &mut Command) -> Option<Vec<u8>> {
+pub(crate) fn run_hidden(command: &mut Command) -> Option<Vec<u8>> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -888,6 +919,7 @@ pub fn launch_game(
             place.job_id.as_deref(),
             tracker,
         );
+        let launched_at = processes::now_filetime();
         let child = spawn_new_window(&exe, &ticket, &join_url)?;
 
         if limits.tile {
@@ -903,6 +935,7 @@ pub fn launch_game(
         return Ok(LaunchOutcome {
             kind: LaunchKind::NewWindow,
             notes,
+            launched_at,
         });
     }
 
@@ -916,10 +949,12 @@ pub fn launch_game(
         place.job_id.as_deref(),
         &ticket,
     );
+    let launched_at = processes::now_filetime();
     open::that(uri).map_err(|err| format!("Не удалось открыть клиент Roblox: {err}"))?;
     Ok(LaunchOutcome {
         kind: LaunchKind::Deeplink,
         notes,
+        launched_at,
     })
 }
 
@@ -1199,5 +1234,52 @@ mod tests {
         assert!(url.contains("placeId=1818"));
         assert!(url.contains("browserTrackerId=1234"));
         assert!(url.contains("isPlayTogetherGame=false"));
+    }
+}
+
+#[cfg(test)]
+mod account_destination_tests {
+    use super::*;
+
+    const JOB: &str = "d1e7b1e3-129e-404f-8882-d29d26c72dcd";
+
+    #[test]
+    fn the_toolbar_is_used_when_the_account_has_nothing_of_its_own() {
+        let dest = destination_for_account("", "", "1818", JOB);
+        assert_eq!(dest.place_id, 1818);
+        assert_eq!(dest.job_id.as_deref(), Some(JOB));
+    }
+
+    #[test]
+    fn an_own_game_replaces_the_toolbar_game_and_its_server() {
+        let dest = destination_for_account("920587237", "", "1818", JOB);
+        assert_eq!(dest.place_id, 920_587_237);
+        // The toolbar's server is for another game: not inherited.
+        assert!(dest.job_id.is_none());
+        assert!(dest.private.is_none());
+    }
+
+    #[test]
+    fn an_own_server_alone_joins_the_toolbar_game() {
+        let dest = destination_for_account("", JOB, "1818", "");
+        assert_eq!(dest.place_id, 1818);
+        assert_eq!(dest.job_id.as_deref(), Some(JOB));
+    }
+
+    #[test]
+    fn own_game_and_server_together() {
+        let dest = destination_for_account(
+            "https://www.roblox.com/games/42/Name",
+            "https://www.roblox.com/games/42/Name?privateServerLinkCode=ABC",
+            "1818",
+            JOB,
+        );
+        assert_eq!(dest.place_id, 42);
+        assert_eq!(dest.private, Some(PrivateServer::LinkCode("ABC".into())));
+    }
+
+    #[test]
+    fn nothing_anywhere_is_not_a_destination() {
+        assert!(!destination_for_account("", "", "", "").is_valid());
     }
 }

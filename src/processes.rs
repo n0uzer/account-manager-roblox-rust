@@ -5,6 +5,7 @@
 //! the window pinner and the memory trimmer need this list.
 
 /// Executable name of the game client.
+#[cfg_attr(not(windows), allow(dead_code))]
 const CLIENT_EXE: &str = "RobloxPlayerBeta.exe";
 
 /// Ids of running client processes.
@@ -26,6 +27,43 @@ pub fn now_filetime() -> u64 {
 /// Pid that owns the foreground window, if any.
 pub fn foreground_pid() -> Option<u32> {
     win::foreground_pid()
+}
+
+/// A running client process and when it was created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Proc {
+    pub pid: u32,
+    /// FILETIME ticks, comparable with [`now_filetime`].
+    pub created: u64,
+}
+
+/// Running client processes with their creation times. A process whose time
+/// cannot be read (it just exited, or access was refused) is left out.
+pub fn client_procs() -> Vec<Proc> {
+    win::client_procs()
+}
+
+/// End client processes. Only pids that are client processes *right now* are
+/// touched, so a pid that Windows has meanwhile given to something else is safe.
+/// Returns how many were ended.
+pub fn kill(pids: &[u32]) -> usize {
+    let running = client_pids();
+    pids.iter()
+        .filter(|pid| running.contains(pid))
+        .filter(|pid| {
+            crate::roblox::run_hidden(std::process::Command::new("taskkill").args([
+                "/F",
+                "/PID",
+                &pid.to_string(),
+            ]))
+            .is_some()
+        })
+        .count()
+}
+
+/// End every client window. Returns how many were ended.
+pub fn kill_all() -> usize {
+    kill(&client_pids())
 }
 
 #[cfg(windows)]
@@ -90,8 +128,8 @@ mod win {
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
     }
 
-    /// Client processes; only those created at or after `since` when it is set.
-    pub(super) fn client_pids(since: u64) -> Vec<u32> {
+    /// Every client process, in snapshot order.
+    fn all_client_pids() -> Vec<u32> {
         let mut pids = Vec::new();
         // SAFETY: the snapshot handle is closed before returning.
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
@@ -106,7 +144,7 @@ mod win {
 
         let mut more = unsafe { Process32FirstW(snapshot, &mut entry) };
         while more != 0 {
-            if is_client(&entry) && (since == 0 || started_after(entry.process_id, since)) {
+            if is_client(&entry) {
                 pids.push(entry.process_id);
             }
             more = unsafe { Process32NextW(snapshot, &mut entry) };
@@ -114,6 +152,24 @@ mod win {
 
         unsafe { CloseHandle(snapshot) };
         pids
+    }
+
+    /// Client processes; only those created at or after `since` when it is set.
+    pub(super) fn client_pids(since: u64) -> Vec<u32> {
+        let all = all_client_pids();
+        if since == 0 {
+            return all;
+        }
+        all.into_iter()
+            .filter(|pid| creation_time(*pid).is_some_and(|created| created >= since))
+            .collect()
+    }
+
+    pub(super) fn client_procs() -> Vec<super::Proc> {
+        all_client_pids()
+            .into_iter()
+            .filter_map(|pid| creation_time(pid).map(|created| super::Proc { pid, created }))
+            .collect()
     }
 
     fn is_client(entry: &ProcessEntry32W) -> bool {
@@ -126,11 +182,12 @@ mod win {
         name.eq_ignore_ascii_case(super::CLIENT_EXE)
     }
 
-    fn started_after(pid: u32, since: u64) -> bool {
+    /// FILETIME ticks at which the process was created, if it can be read.
+    fn creation_time(pid: u32) -> Option<u64> {
         // SAFETY: the handle is closed before returning.
         let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if process.is_null() {
-            return false;
+            return None;
         }
         let mut creation = FileTime { low: 0, high: 0 };
         let mut exit = FileTime { low: 0, high: 0 };
@@ -139,7 +196,7 @@ mod win {
         let ok =
             unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
         unsafe { CloseHandle(process) };
-        ok != 0 && creation.ticks() >= since
+        (ok != 0).then(|| creation.ticks())
     }
 
     pub(super) fn now_filetime() -> u64 {
@@ -165,6 +222,10 @@ mod win {
 #[cfg(not(windows))]
 mod win {
     pub(super) fn client_pids(_since: u64) -> Vec<u32> {
+        Vec::new()
+    }
+
+    pub(super) fn client_procs() -> Vec<super::Proc> {
         Vec::new()
     }
 
@@ -195,6 +256,23 @@ mod tests {
         // Whether or not the client runs here, the scan must finish and return
         // real ids instead of garbage from a wrong struct layout.
         assert!(client_pids().iter().all(|pid| *pid > 4));
+    }
+
+    #[test]
+    fn procs_carry_plausible_creation_times() {
+        let now = now_filetime();
+        for proc in client_procs() {
+            assert!(proc.pid > 4);
+            // Created in the past, not in some garbage-filled future.
+            assert!(proc.created <= now);
+        }
+    }
+
+    #[test]
+    fn killing_a_pid_that_is_not_a_client_does_nothing() {
+        // Pid 4 is the Windows kernel, pid 1 is init elsewhere: neither is a
+        // Roblox client, so nothing may be touched.
+        assert_eq!(kill(&[1, 4]), 0);
     }
 
     #[test]

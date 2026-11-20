@@ -8,13 +8,26 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, vec2, Align, Align2, Color32, Layout, RichText, Sense, Stroke};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::{Config, SortKey};
+use crate::antiafk;
+use crate::autostart;
+use crate::config::{Config, SortKey, Theme};
 use crate::jobs::{self, Done, Job};
+use crate::lookup::Presence;
 use crate::memory;
+use crate::presets::Presets;
 use crate::roblox::{self, CheckError};
 use crate::singleton;
-use crate::store::{self, Account, Store, MIN_PASSWORD_CHARS};
+use crate::store::{self, Account, AccountPatch, Store, MIN_PASSWORD_CHARS};
+use crate::watch;
 use crate::window;
+
+mod bulk;
+mod lookup_ui;
+mod presets_ui;
+mod windows_ui;
+
+use lookup_ui::Outcome;
+use windows_ui::SLOT_RETRY;
 
 const CLIPBOARD_TTL: Duration = Duration::from_secs(60);
 /// Bounds of the configurable gap between two launches of a batch, seconds.
@@ -33,6 +46,8 @@ const COL_DOT: f32 = 22.0;
 const COL_NAME: f32 = 170.0;
 const COL_USER: f32 = 160.0;
 const COL_ID: f32 = 100.0;
+const COL_GROUP: f32 = 100.0;
+const COL_STATUS: f32 = 70.0;
 
 const AUTO_LOCK_CHOICES: [u32; 5] = [0, 1, 5, 15, 30];
 const QUALITY_CHOICES: [u32; 11] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
@@ -90,18 +105,31 @@ struct Form {
     label: String,
     cookie: String,
     note: String,
+    group: String,
+    place_id: String,
+    server: String,
     error: String,
     reveal: bool,
     focus_first: bool,
 }
 
 impl Form {
-    fn new(editing: Option<String>, label: String, note: String) -> Self {
+    fn new(
+        editing: Option<String>,
+        label: String,
+        note: String,
+        group: String,
+        place_id: String,
+        server: String,
+    ) -> Self {
         Form {
             editing,
             label,
             cookie: String::new(),
             note,
+            group,
+            place_id,
+            server,
             error: String::new(),
             reveal: false,
             focus_first: true,
@@ -145,16 +173,59 @@ struct Row {
     username: String,
     user_id: u64,
     note: String,
+    group: String,
+    /// The account has a game (or server) of its own, set in its form.
+    own_game: bool,
+    /// There is somewhere to launch this account: its own game or the toolbar's.
+    can_launch: bool,
 }
 
 impl Row {
-    fn from(account: &Account) -> Self {
+    fn from(account: &Account, can_launch: bool) -> Self {
         Row {
             id: account.id.clone(),
             label: account.label.clone(),
             username: account.username.clone(),
             user_id: account.user_id,
             note: account.note.clone(),
+            group: account.group.clone(),
+            own_game: !account.place_id.trim().is_empty() || !account.server.trim().is_empty(),
+            can_launch,
+        }
+    }
+}
+
+/// Optional list columns: shown only when they have something to say.
+#[derive(Clone, Copy)]
+struct Columns {
+    group: bool,
+    status: bool,
+}
+
+/// Which accounts the list shows, by group.
+#[derive(Clone, PartialEq, Eq, Default, Debug)]
+enum GroupFilter {
+    #[default]
+    All,
+    Ungrouped,
+    Named(String),
+}
+
+impl GroupFilter {
+    fn matches(&self, group: &str) -> bool {
+        let group = group.trim();
+        match self {
+            GroupFilter::All => true,
+            GroupFilter::Ungrouped => group.is_empty(),
+            GroupFilter::Named(name) => group.eq_ignore_ascii_case(name) || group == name,
+        }
+    }
+
+    fn caption(&self) -> String {
+        match self {
+            GroupFilter::All => "все группы".to_string(),
+            GroupFilter::Ungrouped => "без группы".to_string(),
+            GroupFilter::Named(name) => name.clone(),
         }
     }
 }
@@ -229,6 +300,38 @@ pub struct App {
     pending: usize,
 
     last_activity: Instant,
+
+    presets: Presets,
+    presets_window: Option<presets_ui::PresetsWindow>,
+
+    group_filter: GroupFilter,
+    bulk_import: Option<bulk::BulkImport>,
+    bulk_edit: Option<bulk::BulkEdit>,
+
+    /// Cookie check started right after unlocking, summarised when it ends.
+    startup_check: Option<lookup_ui::StartupCheck>,
+    /// Latest online status by Roblox user id.
+    presence: HashMap<u64, Presence>,
+    presence_next: Option<Instant>,
+    presence_loading: bool,
+    details: HashMap<String, lookup_ui::DetailsState>,
+    game_search: Option<lookup_ui::GameSearch>,
+    player_search: Option<lookup_ui::PlayerSearch>,
+
+    /// Which window belongs to which account, and the relaunch bookkeeping.
+    tracker: watch::Tracker,
+    limiter: watch::RelaunchLimiter,
+    relaunch: VecDeque<String>,
+    next_relaunch_at: Option<Instant>,
+    next_watch_poll: Instant,
+    /// Launch jobs sent to the worker that have not finished yet.
+    launching: usize,
+    window_count: usize,
+    window_count_at: Option<Instant>,
+
+    autostart_enabled: bool,
+    /// When the "close all windows" button was first pressed.
+    kill_armed: Option<Instant>,
 }
 
 impl App {
@@ -272,6 +375,28 @@ impl App {
             checks: HashMap::new(),
             pending: 0,
             last_activity: Instant::now(),
+            presets: Presets::load(),
+            presets_window: None,
+            group_filter: GroupFilter::All,
+            bulk_import: None,
+            bulk_edit: None,
+            startup_check: None,
+            presence: HashMap::new(),
+            presence_next: None,
+            presence_loading: false,
+            details: HashMap::new(),
+            game_search: None,
+            player_search: None,
+            tracker: watch::Tracker::default(),
+            limiter: watch::RelaunchLimiter::default(),
+            relaunch: VecDeque::new(),
+            next_relaunch_at: None,
+            next_watch_poll: Instant::now(),
+            launching: 0,
+            window_count: 0,
+            window_count_at: None,
+            autostart_enabled: autostart::is_enabled(),
+            kill_armed: None,
         };
 
         // Claim the client's single-instance names before any launch, so that
@@ -286,6 +411,8 @@ impl App {
         if app.config.trim_memory {
             memory::enable();
         }
+
+        antiafk::configure(app.config.anti_afk, app.config.anti_afk_minutes);
 
         app
     }
@@ -324,6 +451,24 @@ impl App {
 
     fn fail(&mut self, text: impl Into<String>) {
         self.say(Tone::Error, text);
+    }
+
+    /// Apply the configured colour scheme.
+    pub fn apply_theme(&self, ctx: &egui::Context) {
+        ctx.set_theme(match self.config.theme {
+            Theme::System => egui::ThemePreference::System,
+            Theme::Dark => egui::ThemePreference::Dark,
+            Theme::Light => egui::ThemePreference::Light,
+        });
+    }
+
+    /// Everything that starts by itself once the store has been opened.
+    fn after_unlock(&mut self) {
+        if self.config.live_status {
+            self.presence_next = Some(Instant::now());
+        }
+        self.start_unlock_check();
+        self.run_autorun_preset();
     }
 
     // ------------------------------------------------------------ lock screen
@@ -470,6 +615,7 @@ impl App {
             self.reveal_password = false;
             self.last_activity = Instant::now();
             self.info("Хранилище открыто");
+            self.after_unlock();
         } else {
             // Let the user retype right away.
             self.focus_password = true;
@@ -488,6 +634,21 @@ impl App {
         self.show_cookie = None;
         self.confirm_delete = None;
         self.transfer = None;
+        self.bulk_import = None;
+        self.bulk_edit = None;
+        self.presets_window = None;
+        self.game_search = None;
+        self.player_search = None;
+        self.startup_check = None;
+        self.presence.clear();
+        self.presence_next = None;
+        self.presence_loading = false;
+        self.details.clear();
+        // Without cookies nothing can be relaunched, so the watcher stops too.
+        self.tracker.clear();
+        self.limiter.reset();
+        self.relaunch.clear();
+        self.next_relaunch_at = None;
         self.checks.clear();
         self.password.zeroize();
         self.password_repeat.zeroize();
@@ -547,6 +708,9 @@ impl App {
                     }
                 });
 
+                ui.menu_button("Пресеты", |ui| self.presets_menu(ui));
+                ui.menu_button("Окна", |ui| self.windows_menu(ui));
+
                 ui.menu_button("Настройки", |ui| {
                     ui.menu_button("Автоблокировка", |ui| {
                         for option in AUTO_LOCK_CHOICES {
@@ -575,6 +739,9 @@ impl App {
                     {
                         self.toggle_dpapi(dpapi);
                     }
+
+                    ui.separator();
+                    self.settings_extras(ui);
                 });
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -610,6 +777,17 @@ impl App {
             && roblox::parse_private_server(&self.config.private_link).is_none()
             && roblox::parse_job_id(&self.config.private_link).is_none();
         let selected_label = self.selected_account().map(|account| account.label.clone());
+        // The selected account may have a game of its own, so the toolbar's place
+        // is not the only thing that makes a launch possible.
+        let launch_ready = self
+            .selected_account()
+            .is_some_and(|account| self.destination_of(account).is_some());
+        let batch_target = self.launch_set.iter().any(|id| {
+            self.store
+                .as_ref()
+                .and_then(|store| store.find(id))
+                .is_some_and(|account| self.destination_of(account).is_some())
+        });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Place ID:");
@@ -685,6 +863,20 @@ impl App {
             {
                 self.open_servers();
             }
+            if ui
+                .button("Найти игру…")
+                .on_hover_text("Поиск игры по названию: клик подставит её Place ID")
+                .clicked()
+            {
+                self.open_game_search();
+            }
+            if ui
+                .button("К игроку…")
+                .on_hover_text("Узнать, где играет игрок, и подставить его игру и сервер")
+                .clicked()
+            {
+                self.open_player_search();
+            }
 
             let launch_text = match &selected_label {
                 Some(label) => format!("Запустить «{}»", shorten(label, 18)),
@@ -696,12 +888,13 @@ impl App {
                     .color(ui.visuals().selection.stroke.color),
             )
             .fill(ui.visuals().selection.bg_fill);
-            let response = ui.add_enabled(selected_label.is_some() && place_valid, launch);
+            let response = ui.add_enabled(selected_label.is_some() && launch_ready, launch);
             let response = if selected_label.is_none() {
                 response.on_disabled_hover_text("Выбери аккаунт в списке")
-            } else if !place_valid {
-                response
-                    .on_disabled_hover_text("Укажи Place ID или вставь ссылку на приватный сервер")
+            } else if !launch_ready {
+                response.on_disabled_hover_text(
+                    "Укажи Place ID или ссылку на приватный сервер — в панели или в настройках аккаунта",
+                )
             } else {
                 response
             };
@@ -715,7 +908,7 @@ impl App {
             } else {
                 format!("Запустить выбранные ({queued})")
             };
-            let batch_ready = queued > 0 && self.config.multi_instance && place_valid;
+            let batch_ready = queued > 0 && self.config.multi_instance && batch_target;
             let response = ui.add_enabled(batch_ready, egui::Button::new(batch_label));
             let response = if queued == 0 {
                 response.on_disabled_hover_text("Отметь аккаунты галочками в списке")
@@ -723,9 +916,10 @@ impl App {
                 response.on_disabled_hover_text(
                     "Включи «Несколько окон»: через deeplink Roblox запускает только один клиент",
                 )
-            } else if !place_valid {
-                response
-                    .on_disabled_hover_text("Укажи Place ID или вставь ссылку на приватный сервер")
+            } else if !batch_target {
+                response.on_disabled_hover_text(
+                    "Укажи Place ID или ссылку на приватный сервер — в панели или в настройках аккаунтов",
+                )
             } else {
                 response
             };
@@ -759,6 +953,8 @@ impl App {
                      0 — запускать без паузы.",
                 );
             });
+
+            self.close_all_button(ui);
         });
     }
 
@@ -1036,14 +1232,36 @@ impl App {
             .map(|store| !store.accounts.is_empty())
             .unwrap_or(false);
 
+        let groups = self
+            .store
+            .as_ref()
+            .map(|store| store.groups())
+            .unwrap_or_default();
+        // A filter on a group that no longer exists would hide everything.
+        if let GroupFilter::Named(name) = &self.group_filter {
+            if !groups.iter().any(|known| known == name) {
+                self.group_filter = GroupFilter::All;
+            }
+        }
+        let marked = self.launch_set.len();
+
         ui.horizontal_wrapped(|ui| {
             if ui.button("Добавить").clicked() {
                 self.open_add();
             }
+            if ui
+                .button("Импорт cookie…")
+                .on_hover_text(
+                    "Добавить много аккаунтов сразу: вставить список или перетащить файл в окно",
+                )
+                .clicked()
+            {
+                self.open_bulk_import(String::new());
+            }
 
             ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("поиск: название, ник, заметка, ID")
+                    .hint_text("поиск: название, ник, группа, заметка, ID")
                     .desired_width(230.0),
             );
             if !self.search.is_empty()
@@ -1053,6 +1271,29 @@ impl App {
                     .clicked()
             {
                 self.search.clear();
+            }
+
+            if !groups.is_empty() {
+                ui.label("Группа:");
+                egui::ComboBox::from_id_salt("group-filter")
+                    .width(120.0)
+                    .selected_text(shorten(&self.group_filter.caption(), 16))
+                    .show_ui(ui, |ui| {
+                        let all = self.group_filter == GroupFilter::All;
+                        if ui.selectable_label(all, "все группы").clicked() {
+                            self.group_filter = GroupFilter::All;
+                        }
+                        let none = self.group_filter == GroupFilter::Ungrouped;
+                        if ui.selectable_label(none, "без группы").clicked() {
+                            self.group_filter = GroupFilter::Ungrouped;
+                        }
+                        for name in &groups {
+                            let current = self.group_filter == GroupFilter::Named(name.clone());
+                            if ui.selectable_label(current, name).clicked() {
+                                self.group_filter = GroupFilter::Named(name.clone());
+                            }
+                        }
+                    });
             }
 
             ui.label("Сортировка:");
@@ -1077,6 +1318,18 @@ impl App {
                     self.validate_all();
                 }
             });
+
+            if ui
+                .add_enabled(
+                    marked > 0,
+                    egui::Button::new(format!("Изменить отмеченные ({marked})")),
+                )
+                .on_hover_text("Задать группу, игру или сервер сразу всем отмеченным галочкой")
+                .on_disabled_hover_text("Отметь аккаунты галочками в списке")
+                .clicked()
+            {
+                self.open_bulk_edit();
+            }
         });
     }
 
@@ -1128,6 +1381,7 @@ impl App {
                     account.user_id,
                 )
             });
+            let selected_id = self.selected.clone();
 
             ui.horizontal_wrapped(|ui| {
                 match &selected {
@@ -1138,6 +1392,12 @@ impl App {
                         }
                         if *user_id != 0 {
                             ui.label(RichText::new(format!("· ID {user_id}")).weak());
+                        }
+                        if let Some((text, tone)) =
+                            selected_id.as_deref().and_then(|id| self.details_line(id))
+                        {
+                            let color = tone.color(ui);
+                            ui.label(RichText::new(format!("· {text}")).color(color));
                         }
                     }
                     None => {
@@ -1155,6 +1415,20 @@ impl App {
                     }
                     if ui.button("Проверить cookie").clicked() {
                         self.run_action(Action::Validate);
+                    }
+                    let asked = selected_id
+                        .as_deref()
+                        .is_some_and(|id| self.details_requested(id));
+                    if ui
+                        .button(if asked {
+                            "Обновить детали"
+                        } else {
+                            "Детали"
+                        })
+                        .on_hover_text("Возраст аккаунта, баланс Robux и Premium")
+                        .clicked()
+                    {
+                        self.request_details();
                     }
                     ui.menu_button("Cookie…", |ui| {
                         if ui
@@ -1189,16 +1463,19 @@ impl App {
                 return;
             }
 
-            self.table_header(ui, &rows);
+            let columns = Columns {
+                group: rows.iter().any(|row| !row.group.is_empty()),
+                status: self.config.live_status,
+            };
+            self.table_header(ui, &rows, columns);
 
-            let place_valid = self.destination().is_some();
             let mut requested: Option<(String, Action)> = None;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     for row in &rows {
-                        self.draw_row(ui, row, place_valid, &mut requested);
+                        self.draw_row(ui, row, columns, &mut requested);
                     }
                 });
 
@@ -1239,7 +1516,7 @@ impl App {
         });
     }
 
-    fn table_header(&mut self, ui: &mut egui::Ui, rows: &[Row]) {
+    fn table_header(&mut self, ui: &mut egui::Ui, rows: &[Row], columns: Columns) {
         let all_marked = rows.iter().all(|row| self.launch_set.contains(&row.id));
 
         ui.horizontal(|ui| {
@@ -1269,6 +1546,16 @@ impl App {
                     ui.label(RichText::new(title).strong());
                 });
             }
+            if columns.group {
+                column(ui, COL_GROUP, 22.0, |ui| {
+                    ui.label(RichText::new("Группа").strong());
+                });
+            }
+            if columns.status {
+                column(ui, COL_STATUS, 22.0, |ui| {
+                    ui.label(RichText::new("Статус").strong());
+                });
+            }
             ui.label(RichText::new("Заметка").strong());
         });
         ui.separator();
@@ -1278,7 +1565,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         row: &Row,
-        place_valid: bool,
+        columns: Columns,
         requested: &mut Option<(String, Action)>,
     ) {
         let selected = self.selected.as_deref() == Some(row.id.as_str());
@@ -1316,7 +1603,17 @@ impl App {
                 status_dot(ui, self.checks.get(&row.id));
             });
             column(ui, COL_NAME, ROW_HEIGHT, |ui| {
-                text_cell(ui, RichText::new(&row.label), None);
+                if row.own_game {
+                    // Tinted name: this account launches its own game or server.
+                    let tint = ui.visuals().hyperlink_color;
+                    text_cell(
+                        ui,
+                        RichText::new(&row.label).color(tint),
+                        Some("У аккаунта своя игра или сервер (см. «Изменить…»)"),
+                    );
+                } else {
+                    text_cell(ui, RichText::new(&row.label), None);
+                }
             });
             column(ui, COL_USER, ROW_HEIGHT, |ui| {
                 if row.username.is_empty() {
@@ -1332,6 +1629,20 @@ impl App {
                     text_cell(ui, RichText::new(row.user_id.to_string()), None);
                 }
             });
+            if columns.group {
+                column(ui, COL_GROUP, ROW_HEIGHT, |ui| {
+                    if row.group.is_empty() {
+                        text_cell(ui, RichText::new("—").weak(), None);
+                    } else {
+                        text_cell(ui, RichText::new(&row.group), Some(&row.group));
+                    }
+                });
+            }
+            if columns.status {
+                column(ui, COL_STATUS, ROW_HEIGHT, |ui| {
+                    self.presence_cell(ui, row.user_id);
+                });
+            }
             text_cell(ui, RichText::new(&row.note), Some(&row.note));
         });
 
@@ -1341,18 +1652,29 @@ impl App {
         if response.clicked() || response.secondary_clicked() {
             self.selected = Some(row.id.clone());
         }
-        if response.double_clicked() && place_valid {
+        if response.double_clicked() && row.can_launch {
             *requested = Some((row.id.clone(), Action::Launch));
         }
 
         response.context_menu(|ui| {
             self.selected = Some(row.id.clone());
             if ui
-                .add_enabled(place_valid, egui::Button::new("Запустить"))
-                .on_disabled_hover_text("Сначала укажи Place ID")
+                .add_enabled(row.can_launch, egui::Button::new("Запустить"))
+                .on_disabled_hover_text(
+                    "Сначала укажи Place ID — в панели или в настройках аккаунта",
+                )
                 .clicked()
             {
                 *requested = Some((row.id.clone(), Action::Launch));
+                ui.close_menu();
+            }
+            let has_window = self.tracker.window_of(&row.id).is_some();
+            if ui
+                .add_enabled(has_window, egui::Button::new("Закрыть окно"))
+                .on_disabled_hover_text("Менеджер не знает открытого окна этого аккаунта")
+                .clicked()
+            {
+                self.close_window_of(&row.id);
                 ui.close_menu();
             }
             ui.separator();
@@ -1418,8 +1740,10 @@ impl App {
         let mut accounts: Vec<&Account> = store
             .accounts
             .iter()
+            .filter(|account| self.group_filter.matches(&account.group))
             .filter(|account| {
                 query.is_empty()
+                    || account.group.to_lowercase().contains(&query)
                     || account.label.to_lowercase().contains(&query)
                     || account.username.to_lowercase().contains(&query)
                     || account.note.to_lowercase().contains(&query)
@@ -1443,7 +1767,10 @@ impl App {
             }
         }
 
-        accounts.into_iter().map(Row::from).collect()
+        accounts
+            .into_iter()
+            .map(|account| Row::from(account, self.destination_of(account).is_some()))
+            .collect()
     }
 
     fn request_avatars(&mut self, rows: &[Row]) {
@@ -1472,6 +1799,9 @@ impl App {
         self.transfer_window(ctx);
         self.log_window(ctx);
         self.servers_window(ctx);
+        self.bulk_windows(ctx);
+        self.presets_dialog(ctx);
+        self.lookup_windows(ctx);
     }
 
     /// Escape closes the topmost dialog.
@@ -1483,6 +1813,11 @@ impl App {
             || self.form.take().is_some()
             || self.transfer.take().is_some()
             || self.show_cookie.take().is_some()
+            || self.bulk_import.take().is_some()
+            || self.bulk_edit.take().is_some()
+            || self.presets_window.take().is_some()
+            || self.game_search.take().is_some()
+            || self.player_search.take().is_some()
         {
             return;
         }
@@ -1499,6 +1834,11 @@ impl App {
         let mut cancel = false;
         let enter = ctx.input(|input| input.key_pressed(egui::Key::Enter));
         let editing = form.editing.is_some();
+        let groups = self
+            .store
+            .as_ref()
+            .map(|store| store.groups())
+            .unwrap_or_default();
 
         egui::Window::new(if editing {
             "Изменить аккаунт"
@@ -1554,6 +1894,42 @@ impl App {
                 submit = true;
             }
 
+            ui.label("Группа");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.group)
+                        .hint_text("необязательно, например «Ферма»")
+                        .desired_width(300.0),
+                );
+                if !groups.is_empty() {
+                    ui.menu_button("существующие ▾", |ui| {
+                        for name in &groups {
+                            if ui.button(name).clicked() {
+                                form.group = name.clone();
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+            });
+            ui.add_space(6.0);
+
+            ui.label("Игра этого аккаунта");
+            ui.add(
+                egui::TextEdit::singleline(&mut form.place_id)
+                    .hint_text("пусто — как в панели запуска; Place ID или ссылка на игру")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+
+            ui.label("Сервер этого аккаунта");
+            ui.add(
+                egui::TextEdit::singleline(&mut form.server)
+                    .hint_text("пусто — любой; ссылка на приватный сервер или Job ID")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(8.0);
+
             let warn = Tone::Warn.color(ui);
             ui.colored_label(
                 warn,
@@ -1588,6 +1964,22 @@ impl App {
 
             if !editing && cookie.is_empty() {
                 form.error = "Вставь .ROBLOSECURITY".into();
+                self.form = Some(form);
+                return;
+            }
+
+            let place = form.place_id.trim();
+            if !place.is_empty() && roblox::parse_place_id(place).is_none() {
+                form.error = "Игра: нужен Place ID или ссылка на игру".into();
+                self.form = Some(form);
+                return;
+            }
+            let server = form.server.trim();
+            if !server.is_empty()
+                && roblox::parse_private_server(server).is_none()
+                && roblox::parse_job_id(server).is_none()
+            {
+                form.error = "Сервер: нужна ссылка на приватный сервер или Job ID".into();
                 self.form = Some(form);
                 return;
             }
@@ -1853,6 +2245,7 @@ impl App {
         let mut open = true;
         let mut reload = false;
         let mut picked: Option<(String, u32, u32)> = None;
+        let mut random = false;
 
         egui::Window::new("Серверы игры")
             .collapsible(false)
@@ -1869,6 +2262,15 @@ impl App {
                         .clicked()
                     {
                         reload = true;
+                    }
+                    let has_room = browser.rows.iter().any(|row| row.playing < row.max_players);
+                    if ui
+                        .add_enabled(has_room, egui::Button::new("Случайный"))
+                        .on_hover_text("Выбрать любой сервер, где ещё есть место")
+                        .on_disabled_hover_text("Список серверов пуст или все заполнены")
+                        .clicked()
+                    {
+                        random = true;
                     }
                     if browser.loading {
                         ui.spinner();
@@ -1920,6 +2322,18 @@ impl App {
                         }
                     });
             });
+
+        if random {
+            use rand::seq::SliceRandom;
+            let open_rows: Vec<&roblox::ServerInfo> = browser
+                .rows
+                .iter()
+                .filter(|row| row.playing < row.max_players)
+                .collect();
+            picked = open_rows
+                .choose(&mut rand::thread_rng())
+                .map(|row| (row.id.clone(), row.playing, row.max_players));
+        }
 
         if let Some((job_id, playing, max_players)) = picked {
             self.config.private_link = job_id.clone();
@@ -1976,7 +2390,14 @@ impl App {
     }
 
     fn open_add(&mut self) {
-        self.form = Some(Form::new(None, String::new(), String::new()));
+        self.form = Some(Form::new(
+            None,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ));
     }
 
     fn open_edit(&mut self) {
@@ -1991,6 +2412,9 @@ impl App {
             Some(id),
             account.label.clone(),
             account.note.clone(),
+            account.group.clone(),
+            account.place_id.clone(),
+            account.server.clone(),
         ));
     }
 
@@ -2001,21 +2425,37 @@ impl App {
 
         let id = match &form.editing {
             Some(existing) => {
-                store.update(
+                store.patch(
                     existing,
-                    Some(&form.label),
-                    Some(&form.note),
-                    if cookie.is_empty() {
-                        None
-                    } else {
-                        Some(&cookie)
+                    AccountPatch {
+                        label: Some(&form.label),
+                        note: Some(&form.note),
+                        cookie: if cookie.is_empty() {
+                            None
+                        } else {
+                            Some(&cookie)
+                        },
+                        group: Some(&form.group),
+                        place_id: Some(&form.place_id),
+                        server: Some(&form.server),
+                        ..AccountPatch::default()
                     },
-                    None,
-                    None,
                 );
                 existing.clone()
             }
-            None => store.add(&form.label, &cookie, &form.note),
+            None => {
+                let id = store.add(&form.label, &cookie, &form.note);
+                store.patch(
+                    &id,
+                    AccountPatch {
+                        group: Some(&form.group),
+                        place_id: Some(&form.place_id),
+                        server: Some(&form.server),
+                        ..AccountPatch::default()
+                    },
+                );
+                id
+            }
         };
 
         if let Some(err) = self.persist() {
@@ -2094,12 +2534,19 @@ impl App {
             self.warn("Сначала выбери аккаунт");
             return;
         };
-        let Some(place) = self.destination() else {
-            self.warn("Укажи Place ID или ссылку на приватный сервер");
+        let Some(place) = self.destination_of(&account) else {
+            self.warn("Укажи Place ID или ссылку на приватный сервер — в панели или у аккаунта");
             return;
         };
         if account.cookie.is_empty() {
             self.warn("У аккаунта нет cookie");
+            return;
+        }
+        if !self.slot_free(&account.id) {
+            self.warn(format!(
+                "Достигнут лимит окон ({}): закрой одно или подними лимит",
+                self.config.max_windows
+            ));
             return;
         }
 
@@ -2111,15 +2558,7 @@ impl App {
         }
 
         self.save_config();
-        self.pending += 1;
-        self.worker.send(Job::Launch {
-            label: account.label.clone(),
-            place,
-            cookie: account.cookie.clone(),
-            multi: self.config.multi_instance,
-            limits: self.limits(),
-            in_batch: false,
-        });
+        self.dispatch_launch(&account, place, false);
         self.info(format!("Запускаю {}…", account.label));
     }
 
@@ -2167,8 +2606,14 @@ impl App {
             self.warn(message);
             return;
         }
-        if self.destination().is_none() {
-            self.warn("Укажи Place ID или ссылку на приватный сервер");
+        let has_target = self.launch_set.iter().any(|id| {
+            self.store
+                .as_ref()
+                .and_then(|store| store.find(id))
+                .is_some_and(|account| self.destination_of(account).is_some())
+        });
+        if !has_target {
+            self.warn("Укажи Place ID или ссылку на приватный сервер — в панели или у аккаунтов");
             return;
         }
 
@@ -2205,18 +2650,17 @@ impl App {
         }
         self.next_launch_at = None;
 
-        let Some(id) = self.queue.pop_front() else {
+        let Some(id) = self.queue.front().cloned() else {
             return;
         };
-        let Some(place) = self.destination() else {
-            let dropped = self.queue.len() + 1;
-            self.queue.clear();
-            self.batch = None;
-            self.warn(format!(
-                "Настройки игры стали некорректными, очередь сброшена ({dropped} не запущено)"
-            ));
+
+        // The window limit holds the queue back instead of dropping anyone.
+        if !self.slot_free(&id) {
+            self.next_launch_at = Some(Instant::now() + SLOT_RETRY);
+            ctx.request_repaint_after(SLOT_RETRY);
             return;
-        };
+        }
+        self.queue.pop_front();
 
         let account = self
             .store
@@ -2225,23 +2669,21 @@ impl App {
             .cloned();
 
         match account {
-            Some(account) if !account.cookie.is_empty() => {
-                self.pending += 1;
-                self.worker.send(Job::Launch {
-                    label: account.label.clone(),
-                    place,
-                    cookie: account.cookie.clone(),
-                    multi: self.config.multi_instance,
-                    limits: self.limits(),
-                    in_batch: true,
-                });
-                let left = self.queue.len();
-                self.info(format!("Запускаю {}… (в очереди: {left})", account.label));
-            }
-            Some(account) => {
+            Some(account) if account.cookie.is_empty() => {
                 self.warn(format!("{}: нет cookie, пропуск", account.label));
                 self.batch_record(&account.label, Err("нет cookie".into()));
             }
+            Some(account) => match self.destination_of(&account) {
+                Some(place) => {
+                    self.dispatch_launch(&account, place, true);
+                    let left = self.queue.len();
+                    self.info(format!("Запускаю {}… (в очереди: {left})", account.label));
+                }
+                None => {
+                    self.warn(format!("{}: не указана игра, пропуск", account.label));
+                    self.batch_record(&account.label, Err("не указана игра".into()));
+                }
+            },
             None => {
                 self.warn("Аккаунт удалён, пропуск");
                 self.batch_record("аккаунт", Err("удалён".into()));
@@ -2421,13 +2863,23 @@ impl App {
                     self.apply_validated(id, result);
                 }
                 Done::Launched {
+                    id,
                     label,
                     in_batch,
                     result,
                 } => {
                     self.pending = self.pending.saturating_sub(1);
+                    self.launching = self.launching.saturating_sub(1);
                     match &result {
-                        Ok(outcome) => self.ok(format!("{label}: запущен ({})", outcome.summary())),
+                        Ok(outcome) => {
+                            self.ok(format!("{label}: запущен ({})", outcome.summary()));
+                            // Only while unlocked: a launch finishing after the
+                            // lock must not feed the tracker of a closed store.
+                            if self.store.is_some() {
+                                self.tracker.launched(&id, outcome.launched_at);
+                            }
+                            self.window_count_at = None;
+                        }
                         Err(err) => self.fail(format!("{label}: {err}")),
                     }
                     if in_batch {
@@ -2463,6 +2915,10 @@ impl App {
                         self.info(format!("Серверов найдено: {count}"));
                     }
                 }
+                Done::Presence { result } => self.handle_presence(result),
+                Done::Details { id, result } => self.handle_details(id, result),
+                Done::Games { result } => self.handle_games(result),
+                Done::Player { result } => self.handle_player(result),
                 Done::Avatar { user_id, result } => {
                     self.avatars_loading.remove(&user_id);
                     if let Ok(image) = result {
@@ -2493,9 +2949,17 @@ impl App {
         match result {
             Ok(profile) => {
                 if let Some(store) = self.store.as_mut() {
-                    store.update(&id, None, None, None, Some(&profile.name), Some(profile.id));
+                    store.patch(
+                        &id,
+                        AccountPatch {
+                            username: Some(&profile.name),
+                            user_id: Some(profile.id),
+                            ..AccountPatch::default()
+                        },
+                    );
                 }
-                self.checks.insert(id, Check::Valid);
+                self.checks.insert(id.clone(), Check::Valid);
+                self.note_startup_check(&id, &label, Outcome::Valid);
                 if let Some(err) = self.persist() {
                     self.fail(format!("Ошибка сохранения: {err}"));
                     return;
@@ -2504,13 +2968,16 @@ impl App {
             }
             Err(err @ CheckError::Dead(_)) => {
                 let message = err.message().to_string();
-                self.checks.insert(id, Check::Dead(message.clone()));
+                self.checks.insert(id.clone(), Check::Dead(message.clone()));
                 self.fail(format!("{label}: {message}"));
+                self.note_startup_check(&id, &label, Outcome::Dead);
             }
             Err(err) => {
                 let message = err.message().to_string();
-                self.checks.insert(id, Check::Unknown(message.clone()));
+                self.checks
+                    .insert(id.clone(), Check::Unknown(message.clone()));
                 self.warn(format!("{label}: проверка не удалась — {message}"));
+                self.note_startup_check(&id, &label, Outcome::Unknown);
             }
         }
     }
@@ -2600,6 +3067,11 @@ impl eframe::App for App {
         self.tick_clipboard();
         self.poll_worker(ctx);
         self.tick_queue(ctx);
+        if self.store.is_some() {
+            self.take_dropped_files(ctx);
+            self.tick_watch(ctx);
+            self.tick_presence(ctx);
+        }
 
         if self.store.is_none() {
             self.lock_screen(ctx);

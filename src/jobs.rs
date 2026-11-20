@@ -1,9 +1,11 @@
 //! Background worker: every network call happens on one dedicated thread, so
 //! the UI never freezes while a ticket or an avatar is being fetched.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::avatar::{self, AvatarImage};
+use crate::lookup::{self, Details, GameHit, Presence, Target};
 use crate::roblox::{self, CheckError, Destination, LaunchOutcome, Limits, Profile};
 
 pub enum Job {
@@ -12,6 +14,8 @@ pub enum Job {
         cookie: String,
     },
     Launch {
+        /// Local account id, to tell the window tracker whose launch this was.
+        id: String,
         label: String,
         place: Destination,
         cookie: String,
@@ -26,6 +30,25 @@ pub enum Job {
     Servers {
         place_id: u64,
     },
+    /// Online / in-game status of several users, asked with one account's cookie.
+    Presence {
+        cookie: String,
+        user_ids: Vec<u64>,
+    },
+    /// Age, Robux and Premium of one account.
+    Details {
+        id: String,
+        user_id: u64,
+        cookie: String,
+    },
+    SearchGames {
+        query: String,
+    },
+    /// Where a player is playing right now.
+    FindPlayer {
+        cookie: String,
+        who: String,
+    },
 }
 
 pub enum Done {
@@ -34,6 +57,7 @@ pub enum Done {
         result: Result<Profile, CheckError>,
     },
     Launched {
+        id: String,
         label: String,
         in_batch: bool,
         result: Result<LaunchOutcome, String>,
@@ -45,6 +69,19 @@ pub enum Done {
     Servers {
         place_id: u64,
         result: Result<Vec<roblox::ServerInfo>, String>,
+    },
+    Presence {
+        result: Result<HashMap<u64, Presence>, String>,
+    },
+    Details {
+        id: String,
+        result: Result<Details, String>,
+    },
+    Games {
+        result: Result<Vec<GameHit>, String>,
+    },
+    Player {
+        result: Result<Target, String>,
     },
 }
 
@@ -63,33 +100,7 @@ impl Worker {
             .name("rbm-worker".into())
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let done = match job {
-                        Job::Validate { id, cookie } => Done::Validated {
-                            id,
-                            result: roblox::fetch_identity(&cookie),
-                        },
-                        Job::Launch {
-                            label,
-                            place,
-                            cookie,
-                            multi,
-                            limits,
-                            in_batch,
-                        } => Done::Launched {
-                            label,
-                            in_batch,
-                            result: roblox::launch_game(place, &cookie, multi, limits),
-                        },
-                        Job::Avatar { user_id } => Done::Avatar {
-                            user_id,
-                            result: avatar::load(user_id),
-                        },
-                        Job::Servers { place_id } => Done::Servers {
-                            place_id,
-                            result: roblox::fetch_servers(place_id),
-                        },
-                    };
-
+                    let done = run(job);
                     if done_tx.send(done).is_err() {
                         break;
                     }
@@ -108,5 +119,53 @@ impl Worker {
 
     pub fn try_recv(&self) -> Option<Done> {
         self.results.try_recv().ok()
+    }
+}
+
+fn run(job: Job) -> Done {
+    match job {
+        Job::Validate { id, cookie } => Done::Validated {
+            id,
+            result: roblox::fetch_identity(&cookie),
+        },
+        Job::Launch {
+            id,
+            label,
+            place,
+            cookie,
+            multi,
+            limits,
+            in_batch,
+        } => Done::Launched {
+            id,
+            label,
+            in_batch,
+            result: roblox::launch_game(place, &cookie, multi, limits),
+        },
+        Job::Avatar { user_id } => Done::Avatar {
+            user_id,
+            result: avatar::load(user_id),
+        },
+        Job::Servers { place_id } => Done::Servers {
+            place_id,
+            result: roblox::fetch_servers(place_id),
+        },
+        Job::Presence { cookie, user_ids } => Done::Presence {
+            result: lookup::fetch_presence(&cookie, &user_ids),
+        },
+        Job::Details {
+            id,
+            user_id,
+            cookie,
+        } => Done::Details {
+            id,
+            result: lookup::fetch_details(&cookie, user_id),
+        },
+        Job::SearchGames { query } => Done::Games {
+            result: lookup::search_games(&query),
+        },
+        Job::FindPlayer { cookie, who } => Done::Player {
+            result: lookup::find_player(&cookie, &who),
+        },
     }
 }
