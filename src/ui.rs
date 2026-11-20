@@ -1032,9 +1032,10 @@ impl App {
                 save = true;
             }
 
-            let per_window = ui
+            let (per_window, apply_now) = ui
                 .add_enabled_ui(multi, |ui| {
                     let mut save = false;
+                    let mut apply_now = false;
                     let tiled = self.config.tile_windows;
 
                     ui.label("Разрешение окна:");
@@ -1067,6 +1068,23 @@ impl App {
                          0 в ширине или высоте — окно обычного размера.",
                     );
 
+                    let can_apply =
+                        !tiled && self.config.window_width > 0 && self.config.window_height > 0;
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("применить сейчас").small())
+                        .on_hover_text(
+                            "Задать этот размер уже открытым окнам и показать, какой размер \
+                             получился. Без этого размер ставится только при запуске и \
+                             держится первые 90 секунд.",
+                        )
+                        .on_disabled_hover_text(
+                            "Нужны ширина и высота больше нуля и выключенная «Раскладка сеткой»",
+                        )
+                        .clicked()
+                    {
+                        apply_now = true;
+                    }
+
                     ui.add_space(6.0);
                     if ui
                         .checkbox(&mut self.config.tile_windows, "Раскладка сеткой")
@@ -1094,10 +1112,18 @@ impl App {
                         self.info("Раскладываю окна…");
                     }
 
-                    save
+                    (save, apply_now)
                 })
                 .inner;
             save |= per_window;
+            if apply_now {
+                let want = (self.config.window_width, self.config.window_height);
+                let got = window::apply_size_now(want.0, want.1);
+                match size_report(want, &got) {
+                    Ok(text) => self.ok(text),
+                    Err(text) => self.warn(text),
+                }
+            }
 
             if multi && self.config.tile_windows {
                 ui.label("(сетка задаёт размер сама)").on_hover_text(
@@ -1105,10 +1131,11 @@ impl App {
                      размер окна считает менеджер.",
                 );
             } else if multi {
-                ui.label("(окно не меньше 800×600)").on_hover_text(
-                    "Клиент не любит окна меньше 800×600: ниже этого размера он рисует \
-                     только часть кадра. Включай «Раскладку сеткой», если нужно больше \
-                     окон на одном экране.",
+                ui.label("(можно и меньше 800×600)").on_hover_text(
+                    "Клиент сам не уменьшает окно ниже 800×600, но менеджер обходит это \
+                     ограничение. Ниже этого размера игра рисует только часть кадра. \
+                     Если окно не стало меньше, нажми «применить сейчас»: менеджер покажет, \
+                     какой размер получился.",
                 );
             } else {
                 ui.label("(только для «Несколько окон»): deeplink не отдаёт нам процесс")
@@ -3241,6 +3268,37 @@ fn shorten(text: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
+/// Text for the result of "apply size now": `Ok` when every window has the
+/// requested client area (give or take rounding), `Err` when the client kept or
+/// restored another size.
+fn size_report(want: (u32, u32), got: &[(u32, u32)]) -> Result<String, String> {
+    if got.is_empty() {
+        return Err("Нет открытых окон клиента, которым можно задать размер".into());
+    }
+    let near = |a: u32, b: u32| a.abs_diff(b) <= 2;
+    let wrong: Vec<String> = got
+        .iter()
+        .filter(|(w, h)| !near(*w, want.0) || !near(*h, want.1))
+        .map(|(w, h)| format!("{w}×{h}"))
+        .collect();
+    if wrong.is_empty() {
+        return Ok(format!(
+            "Размер {}×{} применён: окон {}",
+            want.0,
+            want.1,
+            got.len()
+        ));
+    }
+    Err(format!(
+        "Запрошено {}×{}, а у {} из {} окон получилось: {}. Клиент вернул размер сам",
+        want.0,
+        want.1,
+        wrong.len(),
+        got.len(),
+        wrong.join(", ")
+    ))
+}
+
 /// Age of a journal line for display.
 fn ago(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
@@ -3262,6 +3320,18 @@ mod tests {
         assert_eq!(shorten("abcdefghij", 5), "abcd…");
         // Characters, not bytes: Cyrillic must not be cut in the middle.
         assert_eq!(shorten("Тестовый аккаунт", 8), "Тестовы…");
+    }
+
+    #[test]
+    fn size_report_says_whether_the_client_kept_the_size() {
+        let ok = size_report((640, 480), &[(640, 480), (639, 480)]);
+        assert!(ok.expect("accepted").contains("640×480"));
+
+        let err = size_report((640, 480), &[(640, 480), (800, 600)]).expect_err("clamped");
+        assert!(err.contains("1 из 2"), "{err}");
+        assert!(err.contains("800×600"), "{err}");
+
+        assert!(size_report((640, 480), &[]).is_err());
     }
 
     #[test]
