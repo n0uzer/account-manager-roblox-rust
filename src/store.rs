@@ -11,10 +11,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::backup;
 use crate::crypto;
 
 const SCHEMA: u32 = 1;
 pub const MIN_PASSWORD_CHARS: usize = 6;
+/// Label given to an account added without a name.
+pub const DEFAULT_LABEL: &str = "account";
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Account {
@@ -27,6 +30,33 @@ pub struct Account {
     /// Unix timestamp (seconds) of when the account was added.
     #[serde(default)]
     pub created_at: i64,
+    /// Free-form group name, empty for none.
+    ///
+    /// The fields below were added after the first release: `serde(default)`
+    /// keeps older store files readable.
+    #[serde(default)]
+    pub group: String,
+    /// Game this account launches, a Place ID or a game link. Empty means "use
+    /// the one in the toolbar".
+    #[serde(default)]
+    pub place_id: String,
+    /// Private server link or Job ID for this account. Empty means "use the one
+    /// in the toolbar".
+    #[serde(default)]
+    pub server: String,
+}
+
+/// Fields to change on an account; `None` leaves a field as it is.
+#[derive(Default)]
+pub struct AccountPatch<'a> {
+    pub label: Option<&'a str>,
+    pub note: Option<&'a str>,
+    pub cookie: Option<&'a str>,
+    pub username: Option<&'a str>,
+    pub user_id: Option<u64>,
+    pub group: Option<&'a str>,
+    pub place_id: Option<&'a str>,
+    pub server: Option<&'a str>,
 }
 
 #[derive(Deserialize, Default)]
@@ -117,6 +147,8 @@ impl Store {
     /// Open an existing store with the master password.
     pub fn unlock(path: PathBuf, password: &str) -> Result<Self, String> {
         let (accounts, salt, key, dpapi) = Self::read(&path, password)?;
+        // The file just proved readable: keep that known-good state around.
+        backup::snapshot_if_due(&path);
         Ok(Store {
             path,
             salt,
@@ -164,6 +196,8 @@ impl Store {
             file.sync_all()
         };
         write().map_err(|err| format!("Не могу записать файл: {err}"))?;
+        // Keep the state we are about to replace (throttled, never fails the save).
+        backup::snapshot_if_due(&self.path);
         fs::rename(&tmp, &self.path).map_err(|err| format!("Не могу заменить файл: {err}"))?;
         Ok(())
     }
@@ -203,47 +237,67 @@ impl Store {
         self.accounts.push(Account {
             id: id.clone(),
             label: if label.trim().is_empty() {
-                "account".to_string()
+                DEFAULT_LABEL.to_string()
             } else {
                 label.trim().to_string()
             },
-            username: String::new(),
-            user_id: 0,
             note: note.trim().to_string(),
             cookie: cookie.to_string(),
             created_at: now_unix(),
+            ..Account::default()
         });
         id
     }
 
-    pub fn update(
-        &mut self,
-        id: &str,
-        label: Option<&str>,
-        note: Option<&str>,
-        cookie: Option<&str>,
-        username: Option<&str>,
-        user_id: Option<u64>,
-    ) {
-        if let Some(account) = self.find_mut(id) {
-            if let Some(value) = label {
-                if !value.trim().is_empty() {
-                    account.label = value.trim().to_string();
-                }
-            }
-            if let Some(value) = note {
-                account.note = value.trim().to_string();
-            }
-            if let Some(value) = cookie {
-                account.cookie = value.to_string();
-            }
-            if let Some(value) = username {
-                account.username = value.to_string();
-            }
-            if let Some(value) = user_id {
-                account.user_id = value;
+    /// Apply the set fields of `patch` to the account with this id.
+    pub fn patch(&mut self, id: &str, patch: AccountPatch<'_>) {
+        let Some(account) = self.find_mut(id) else {
+            return;
+        };
+        if let Some(value) = patch.label {
+            // An empty name would leave a blank row: keep the old one.
+            if !value.trim().is_empty() {
+                account.label = value.trim().to_string();
             }
         }
+        if let Some(value) = patch.note {
+            account.note = value.trim().to_string();
+        }
+        if let Some(value) = patch.cookie {
+            account.cookie = value.to_string();
+        }
+        if let Some(value) = patch.username {
+            account.username = value.to_string();
+        }
+        if let Some(value) = patch.user_id {
+            account.user_id = value;
+        }
+        if let Some(value) = patch.group {
+            account.group = value.trim().to_string();
+        }
+        if let Some(value) = patch.place_id {
+            account.place_id = value.trim().to_string();
+        }
+        if let Some(value) = patch.server {
+            account.server = value.trim().to_string();
+        }
+    }
+
+    /// Distinct group names in use, sorted without regard to case.
+    pub fn groups(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for account in &self.accounts {
+            let group = account.group.trim();
+            if !group.is_empty()
+                && !names
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(group) || known == group)
+            {
+                names.push(group.to_string());
+            }
+        }
+        names.sort_by_cached_key(|name| name.to_lowercase());
+        names
     }
 
     pub fn remove(&mut self, id: &str) {
@@ -391,16 +445,106 @@ mod tests {
         imported.push(Account {
             id: "other".into(),
             label: "second".into(),
-            username: String::new(),
-            user_id: 0,
-            note: String::new(),
             cookie: "different-cookie".into(),
-            created_at: 0,
+            ..Account::default()
         });
 
         let added = store.merge(imported);
         assert_eq!(added, 1);
         assert_eq!(store.accounts.len(), 2);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn patch_changes_only_the_set_fields() {
+        let path = temp_path("accounts.dat");
+        let mut store = Store::create(path.clone(), "secret123", false).expect("create");
+        let id = store.add("main", "cookie-value", "note");
+
+        store.patch(
+            &id,
+            AccountPatch {
+                group: Some("  alts "),
+                place_id: Some("1818"),
+                ..AccountPatch::default()
+            },
+        );
+        let account = store.find(&id).expect("account");
+        assert_eq!(account.group, "alts");
+        assert_eq!(account.place_id, "1818");
+        assert_eq!(account.label, "main");
+        assert_eq!(account.note, "note");
+        assert_eq!(account.cookie, "cookie-value");
+
+        // An empty label is ignored, an empty group clears it.
+        store.patch(
+            &id,
+            AccountPatch {
+                label: Some("   "),
+                group: Some(""),
+                ..AccountPatch::default()
+            },
+        );
+        let account = store.find(&id).expect("account");
+        assert_eq!(account.label, "main");
+        assert!(account.group.is_empty());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn old_files_without_the_new_fields_still_load() {
+        // A payload written before groups and per-account games existed.
+        let json = br#"{"schema":1,"accounts":[{"id":"a","label":"old","username":"u",
+            "user_id":5,"note":"","cookie":"c"}]}"#;
+        let payload: Payload = serde_json::from_slice(json).expect("old payload");
+        let account = &payload.accounts[0];
+        assert_eq!(account.label, "old");
+        assert!(account.group.is_empty());
+        assert!(account.place_id.is_empty());
+        assert!(account.server.is_empty());
+    }
+
+    #[test]
+    fn groups_are_distinct_and_sorted() {
+        let path = temp_path("accounts.dat");
+        let mut store = Store::create(path.clone(), "secret123", false).expect("create");
+        for (cookie, group) in [("1", "beta"), ("2", "Alpha"), ("3", "alpha"), ("4", "")] {
+            let id = store.add("x", cookie, "");
+            store.patch(
+                &id,
+                AccountPatch {
+                    group: Some(group),
+                    ..AccountPatch::default()
+                },
+            );
+        }
+        assert_eq!(
+            store.groups(),
+            vec!["Alpha".to_string(), "beta".to_string()]
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn saving_twice_leaves_a_backup_of_the_old_state() {
+        let path = temp_path("accounts.dat");
+        let mut store = Store::create(path.clone(), "secret123", false).expect("create");
+        store.add("main", "cookie-value", "");
+        store.save().expect("first save");
+        store.add("second", "other-cookie", "");
+        store.save().expect("second save");
+
+        // Throttling allows one copy in this burst; it must still be a store the
+        // same password opens.
+        let copies: Vec<_> = fs::read_dir(backup::dir_for(&path))
+            .expect("backups folder")
+            .flatten()
+            .collect();
+        assert_eq!(copies.len(), 1);
+        let restored = read_accounts(&copies[0].path(), "secret123").expect("backup opens");
+        assert!(restored.len() <= 2);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
