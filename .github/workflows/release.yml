@@ -1,0 +1,93 @@
+name: Release
+
+# Publishes a GitHub release with a Windows x64 build.
+#
+#   1. bump `version` in Cargo.toml (and Cargo.lock: `cargo build` updates it);
+#   2. commit, then push a tag that matches it:  git tag v0.5.0 && git push origin v0.5.0
+#
+# The run can also be started by hand from the Actions tab with a tag name; the
+# tag is then created on the commit the run was started from.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.5.0 (must match the version in Cargo.toml)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      # Passed through the environment, never pasted into a script: a tag name
+      # is user input.
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag against Cargo.toml
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+            throw "Tag '$($env:TAG)' is not like v1.2.3 or v1.2.3-rc.1"
+          }
+          $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1
+          $version = $line.Matches[0].Groups[1].Value
+          if ($env:TAG -ne "v$version") {
+            throw "Tag '$($env:TAG)' does not match version $version in Cargo.toml"
+          }
+          Write-Host "Releasing $($env:TAG)"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Tests
+        run: cargo test --locked --all-targets
+
+      - name: Release build
+        run: cargo build --release --locked
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/rbm.exe dist/rbm.exe
+          # `sha256sum` format: "<hash>  <name>", so `sha256sum -c` works.
+          $hash = (Get-FileHash dist/rbm.exe -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Get-Location) 'dist/rbm.exe.sha256'),
+            "$hash  rbm.exe`n")
+          Get-Content dist/rbm.exe.sha256
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          $assets = @('dist/rbm.exe', 'dist/rbm.exe.sha256')
+
+          # A re-run for the same tag replaces the files instead of failing.
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG @assets --clobber
+          } else {
+            $flags = @()
+            # v1.2.3-rc.1 and the like are not offered as the latest release.
+            if ($env:TAG.Contains('-')) { $flags += '--prerelease' }
+            gh release create $env:TAG @assets `
+              --title $env:TAG `
+              --generate-notes `
+              --target $env:GITHUB_SHA `
+              @flags
+          }
+          if ($LASTEXITCODE -ne 0) { throw "gh failed with exit code $LASTEXITCODE" }
