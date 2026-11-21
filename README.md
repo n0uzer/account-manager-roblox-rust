@@ -693,7 +693,8 @@ roblox-account-manager-rs/
 ├── Cargo.toml
 ├── LICENSE
 ├── README.md
-├── .github/workflows/ci.yml
+├── .github/workflows/ci.yml        fmt, clippy, tests, release build
+├── .github/workflows/release.yml   publishes a release for a v* tag
 └── src/
     ├── main.rs      eframe entry point, window size
     ├── crypto.rs    Argon2id + AES-256-GCM, DPAPI layer, file layout
@@ -749,12 +750,34 @@ sharelinks) и Job ID, разбор ответа списка серверов, 
 трогали бы живые аккаунты. Новые модули покрыты на примерах ответов Roblox, написанных
 вручную: пресеты, разбор списка cookie, резервные копии (ротация и интервал), слежение
 за окнами и лимитер перезапусков, разбор ответов статуса, баланса и поиска игр, выбор
-назначения для аккаунта. Всего 140 тестов; код, который работает только в Windows
+назначения для аккаунта. Всего 144 теста; код, который работает только в Windows
 (реестр, окна, ввод анти-AFK), на Linux не собирается и тестами не покрыт — его
 проверяет только CI на `windows-latest`.
 
 GitHub Actions на `windows-latest` прогоняет fmt, clippy, тесты и release-сборку
-на каждый push в `main`.
+на каждый push в `main` и в каждый pull request.
+
+### Выпуск релиза
+
+Релиз собирает и публикует workflow `.github/workflows/release.yml`:
+
+1. Поднять `version` в `Cargo.toml` и закоммитить (`cargo build` заодно обновит
+   `Cargo.lock`; без этого сборка с `--locked` не пройдёт).
+2. Поставить тег, совпадающий с версией, и отправить его:
+
+   ```powershell
+   git tag v0.5.0
+   git push origin v0.5.0
+   ```
+
+Workflow проверяет, что тег совпадает с версией в `Cargo.toml`, гоняет тесты, собирает
+`rbm.exe` (Windows x64) и создаёт релиз с автоописанием из коммитов и pull request'ов.
+К релизу прикладываются `rbm.exe` и `rbm.exe.sha256` (формат `sha256sum`, как описано
+выше). Тег вида `v0.5.0-rc.1` публикуется как пре-релиз. Повторный запуск для того же
+тега заменяет файлы в уже созданном релизе.
+
+Запустить можно и вручную: вкладка Actions → Release → Run workflow, в поле указать
+тег; он будет создан на выбранном коммите.
 
 ---
 
