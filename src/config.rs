@@ -141,6 +141,8 @@ pub struct Config {
     pub anti_afk: bool,
     /// Minutes between inputs; the client kicks at 20.
     pub anti_afk_minutes: u32,
+    /// How the input reaches the window.
+    pub anti_afk_mode: crate::antiafk::Mode,
 }
 
 impl Default for Config {
@@ -181,6 +183,7 @@ impl Default for Config {
             close_previous: true,
             anti_afk: false,
             anti_afk_minutes: crate::antiafk::DEFAULT_MINUTES,
+            anti_afk_mode: crate::antiafk::Mode::Focus,
         }
     }
 }
@@ -312,6 +315,7 @@ mod tests {
         assert!(!config.auto_relaunch);
         assert!(!config.anti_afk);
         assert_eq!(config.anti_afk_minutes, crate::antiafk::DEFAULT_MINUTES);
+        assert_eq!(config.anti_afk_mode, crate::antiafk::Mode::Focus);
         assert_eq!(config.max_windows, 0);
     }
 }
