@@ -412,7 +412,11 @@ impl App {
             memory::enable();
         }
 
-        antiafk::configure(app.config.anti_afk, app.config.anti_afk_minutes);
+        antiafk::configure(
+            app.config.anti_afk,
+            app.config.anti_afk_minutes,
+            app.config.anti_afk_mode,
+        );
 
         app
     }

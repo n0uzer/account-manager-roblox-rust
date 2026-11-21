@@ -149,6 +149,16 @@ impl App {
 
         self.tick_relaunch(ctx);
 
+        // What the last anti-AFK round did, whether the timer or the button
+        // started it.
+        if let Some(report) = antiafk::take_report() {
+            if report.is_ok() {
+                self.info(report.text());
+            } else {
+                self.warn(report.text());
+            }
+        }
+
         // egui does not wake up by itself, and a lost window is only noticed
         // when somebody looks.
         if !self.tracker.is_idle() || !self.relaunch.is_empty() {
@@ -324,8 +334,8 @@ impl App {
                 "Раз в несколько минут отправляет в окна клиента лёгкий ввод — сдвиг мыши \
                  на пиксель и нажатие F15 — чтобы за простой не выкидывало (Roblox кикает \
                  примерно через 20 минут).\n\
-                 Сообщения кладутся прямо в окно: фокус не отбирается, настоящий курсор \
-                 не двигается.\n\
+                 В надёжном режиме каждое окно на долю секунды выходит вперёд, а потом \
+                 фокус возвращается; менеджер ждёт, пока ты перестанешь печатать.\n\
                  Это автоматизация ввода: правила Roblox и отдельных игр могут её не \
                  одобрять. Включено — на свой риск. Работает не с клиентом, запущенным \
                  от администратора.",
@@ -348,18 +358,38 @@ impl App {
 
                 if ui
                     .small_button("сейчас")
-                    .on_hover_text("Отправить один раз прямо сейчас, чтобы проверить")
+                    .on_hover_text(
+                        "Отправить один раз прямо сейчас, чтобы проверить; в журнале \
+                         появится, в сколько окон ввод дошёл",
+                    )
                     .clicked()
                 {
-                    let reached = antiafk::pulse();
-                    self.info(format!("Анти-AFK: ввод отправлен в окон: {reached}"));
+                    antiafk::pulse_in_background(self.config.anti_afk_mode);
+                    ui.ctx().request_repaint_after(Duration::from_secs(1));
+                }
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Режим:");
+                for mode in antiafk::Mode::variants() {
+                    if ui
+                        .radio(self.config.anti_afk_mode == mode, mode.label())
+                        .clicked()
+                    {
+                        self.config.anti_afk_mode = mode;
+                        changed = true;
+                    }
                 }
             });
         });
 
         if changed {
             self.config.anti_afk_minutes = antiafk::clamp_minutes(self.config.anti_afk_minutes);
-            antiafk::configure(self.config.anti_afk, self.config.anti_afk_minutes);
+            antiafk::configure(
+                self.config.anti_afk,
+                self.config.anti_afk_minutes,
+                self.config.anti_afk_mode,
+            );
             self.save_config();
         }
     }
