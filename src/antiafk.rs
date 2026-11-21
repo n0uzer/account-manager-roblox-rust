@@ -1,27 +1,35 @@
-//! Optional anti-AFK: a tiny input event now and then, so a background window is
-//! not kicked for sitting idle.
+//! Optional anti-AFK: a tiny input event now and then, so a window is not kicked
+//! for sitting idle.
 //!
 //! Roblox removes a player who has sent no input for about 20 minutes. Every
-//! `interval` minutes each client window is sent two harmless messages:
+//! `interval` minutes each client window gets a harmless input: a 1-pixel mouse
+//! move and back and a press of F15, a key no game binds to anything. There are
+//! two ways to deliver it ([`Mode`]):
 //!
-//! * a 1-pixel mouse move and back, posted to the window itself, and
-//! * a press of F15, a key no game binds to anything.
+//! * **Focus** (default). The window is brought to the front for a fraction of a
+//!   second, real input is sent with `SendInput`, and the window that was in
+//!   front before is restored. This is what the client sees as a person at the
+//!   keyboard, so it works with every client version. The price is a short flash
+//!   of each window; the manager waits for a quiet moment first, so it does not
+//!   steal focus in the middle of typing.
+//! * **Quiet**. The same events are *posted* to the window (`PostMessageW`):
+//!   nothing takes focus. Current clients mostly ignore input they did not get
+//!   as the active window, so this is kept as an option, not the default.
 //!
-//! The messages are *posted* to the window (`PostMessageW`), so nothing here takes
-//! focus, moves the real cursor or types into whatever window is in front. The
-//! client is not injected into and its memory is not touched. Off by default.
+//! The client is not injected into and its memory is not touched. Off by default.
 //!
 //! Limits worth knowing:
-//! * a client running as administrator ignores messages from a normal-rights
-//!   manager (Windows blocks that on purpose);
-//! * whether the client counts posted messages as "activity" depends on the client
-//!   version, so the effect has to be checked on the real client;
+//! * a client running as administrator ignores input from a normal-rights
+//!   manager (Windows blocks that on purpose) — the report says how many windows
+//!   could not be reached;
 //! * it is still automation: some games and Roblox's rules treat that as a
 //!   violation. Use at your own risk, see the README.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::window;
 
@@ -33,6 +41,93 @@ pub const DEFAULT_MINUTES: u32 = 10;
 /// How often the worker looks at the clock.
 const TICK: Duration = Duration::from_secs(5);
 
+/// How the input reaches the window.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// Bring the window to the front for an instant and send real input.
+    #[default]
+    Focus,
+    /// Post messages to the window and leave the focus alone.
+    Quiet,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Focus => "надёжный: окно на миг выходит вперёд",
+            Mode::Quiet => "тихий: без фокуса (у многих клиентов не срабатывает)",
+        }
+    }
+
+    pub fn variants() -> [Mode; 2] {
+        [Mode::Focus, Mode::Quiet]
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            Mode::Focus => 0,
+            Mode::Quiet => 1,
+        }
+    }
+
+    fn from_u8(value: u8) -> Mode {
+        if value == 1 {
+            Mode::Quiet
+        } else {
+            Mode::Focus
+        }
+    }
+}
+
+/// What one round did, for the journal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Report {
+    pub mode: Mode,
+    /// Client windows found.
+    pub windows: usize,
+    /// Windows that took the input.
+    pub reached: usize,
+    /// Windows that could not be brought to the front (`Mode::Focus` only).
+    pub not_focused: usize,
+}
+
+impl Report {
+    pub fn is_ok(&self) -> bool {
+        self.windows > 0 && self.reached == self.windows
+    }
+
+    pub fn text(&self) -> String {
+        if self.windows == 0 {
+            return "Анти-AFK: окон клиента не найдено".to_string();
+        }
+        let mut text = format!(
+            "Анти-AFK: ввод отправлен в окон {} из {}",
+            self.reached, self.windows
+        );
+        if self.not_focused > 0 {
+            text.push_str(&format!(
+                "; не вышли вперёд: {} (клиент запущен от администратора?)",
+                self.not_focused
+            ));
+        }
+        text
+    }
+}
+
+/// How long the user must have been still before a window is pulled to the
+/// front, in milliseconds.
+#[cfg_attr(not(windows), allow(dead_code))]
+const QUIET_MS: u32 = 1_500;
+/// How long a round waits for such a moment before going ahead anyway.
+#[cfg_attr(not(windows), allow(dead_code))]
+const QUIET_WAIT: Duration = Duration::from_secs(5);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_quiet(idle_ms: u32) -> bool {
+    idle_ms >= QUIET_MS
+}
+
 /// Virtual-key code and scan code of F15.
 #[cfg_attr(not(windows), allow(dead_code))]
 const VK_F15: usize = 0x7E;
@@ -41,7 +136,12 @@ const SCAN_F15: u32 = 0x64;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static MINUTES: AtomicU32 = AtomicU32::new(DEFAULT_MINUTES);
+static MODE: AtomicU8 = AtomicU8::new(0);
 static STARTED: Once = Once::new();
+/// A manual round is running; a second click waits for it.
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// The result of the latest round, until the interface has shown it.
+static LAST_REPORT: Mutex<Option<Report>> = Mutex::new(None);
 
 pub fn clamp_minutes(minutes: u32) -> u32 {
     minutes.clamp(MIN_MINUTES, MAX_MINUTES)
@@ -53,8 +153,9 @@ fn is_due(since_last: Duration, minutes: u32) -> bool {
 }
 
 /// Apply the settings. Starts the worker the first time anti-AFK is turned on.
-pub fn configure(enabled: bool, minutes: u32) {
+pub fn configure(enabled: bool, minutes: u32, mode: Mode) {
     MINUTES.store(clamp_minutes(minutes), Ordering::Relaxed);
+    MODE.store(mode.to_u8(), Ordering::Relaxed);
     ENABLED.store(enabled, Ordering::Relaxed);
     if enabled {
         start_worker();
@@ -76,7 +177,7 @@ fn start_worker() {
                         continue;
                     }
                     if is_due(last.elapsed(), MINUTES.load(Ordering::Relaxed)) {
-                        pulse();
+                        pulse(Mode::from_u8(MODE.load(Ordering::Relaxed)));
                         last = Instant::now();
                     }
                 }
@@ -86,13 +187,47 @@ fn start_worker() {
     });
 }
 
-/// Send one round of input to every client window. Returns how many windows got
-/// it.
-pub fn pulse() -> usize {
-    window::game_window_handles()
-        .into_iter()
-        .filter(|hwnd| win::nudge(*hwnd))
-        .count()
+/// Send one round of input to every client window and remember what happened.
+/// Blocks for a fraction of a second per window in `Mode::Focus`.
+pub fn pulse(mode: Mode) -> Report {
+    let handles = window::game_window_handles();
+    let (reached, not_focused) = match mode {
+        Mode::Quiet => (handles.iter().filter(|hwnd| win::nudge(**hwnd)).count(), 0),
+        Mode::Focus => win::focus_pulse(&handles),
+    };
+    let report = Report {
+        mode,
+        windows: handles.len(),
+        reached,
+        not_focused,
+    };
+    if let Ok(mut last) = LAST_REPORT.lock() {
+        *last = Some(report);
+    }
+    report
+}
+
+/// One round on its own thread, for the "now" button: the interface must not
+/// wait for windows to be brought forward one by one. The result comes back
+/// through [`take_report`].
+pub fn pulse_in_background(mode: Mode) {
+    if BUSY.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("rbm-antiafk-now".into())
+        .spawn(move || {
+            pulse(mode);
+            BUSY.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// The result of the latest round, once. `None` when nothing new happened.
+pub fn take_report() -> Option<Report> {
+    LAST_REPORT.lock().ok().and_then(|mut last| last.take())
 }
 
 /// `lParam` of a mouse message: x in the low word, y in the high word.
@@ -115,6 +250,7 @@ fn key_lparam(scan: u32, release: bool) -> isize {
 #[cfg(windows)]
 mod win {
     use std::ffi::c_void;
+    use std::time::{Duration, Instant};
 
     type Hwnd = *mut c_void;
 
@@ -126,11 +262,74 @@ mod win {
         bottom: i32,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct MouseInput {
+        dx: i32,
+        dy: i32,
+        data: u32,
+        flags: u32,
+        time: u32,
+        extra: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KeyInput {
+        vk: u16,
+        scan: u16,
+        flags: u32,
+        time: u32,
+        extra: usize,
+    }
+
+    #[repr(C)]
+    union InputUnion {
+        mouse: MouseInput,
+        key: KeyInput,
+    }
+
+    /// `INPUT`: 40 bytes on 64-bit Windows, 28 on 32-bit. The union is as large
+    /// as its biggest member, which is what `SendInput` checks the size against.
+    #[repr(C)]
+    struct Input {
+        kind: u32,
+        body: InputUnion,
+    }
+
+    #[repr(C)]
+    struct LastInput {
+        size: u32,
+        time: u32,
+    }
+
     #[link(name = "user32")]
     extern "system" {
         fn PostMessageW(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> i32;
         fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
+        fn GetForegroundWindow() -> Hwnd;
+        fn SetForegroundWindow(hwnd: Hwnd) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn AttachThreadInput(thread: u32, attach_to: u32, attach: i32) -> i32;
+        fn IsIconic(hwnd: Hwnd) -> i32;
+        fn ShowWindow(hwnd: Hwnd, command: i32) -> i32;
+        fn SendInput(count: u32, inputs: *const Input, size: i32) -> u32;
+        fn GetLastInputInfo(info: *mut LastInput) -> i32;
     }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadId() -> u32;
+        fn GetTickCount() -> u32;
+    }
+
+    const INPUT_MOUSE: u32 = 0;
+    const INPUT_KEYBOARD: u32 = 1;
+    const MOUSEEVENTF_MOVE: u32 = 0x0001;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const SW_RESTORE: i32 = 9;
+    /// Minimize without activating, to put a restored window back.
+    const SW_SHOWMINNOACTIVE: i32 = 7;
 
     const WM_KEYDOWN: u32 = 0x0100;
     const WM_KEYUP: u32 = 0x0101;
@@ -178,12 +377,163 @@ mod win {
         }
         delivered
     }
+
+    /// Milliseconds since the last keyboard or mouse input of the user.
+    fn idle_millis() -> Option<u32> {
+        let mut info = LastInput {
+            size: std::mem::size_of::<LastInput>() as u32,
+            time: 0,
+        };
+        // SAFETY: a plain struct with its size filled in, alive for the call.
+        if unsafe { GetLastInputInfo(&mut info) } == 0 {
+            return None;
+        }
+        // SAFETY: no arguments, no side effects.
+        let now = unsafe { GetTickCount() };
+        Some(now.wrapping_sub(info.time))
+    }
+
+    /// Wait (a few seconds at most) until the user has stopped typing or moving
+    /// the mouse, so the focus is not taken in the middle of a word.
+    fn wait_for_quiet() {
+        let until = Instant::now() + super::QUIET_WAIT;
+        while Instant::now() < until {
+            match idle_millis() {
+                Some(idle) if !super::is_quiet(idle) => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// Make `hwnd` the foreground window. Windows lets only the foreground
+    /// thread do that, so this thread borrows its input queue for a moment.
+    fn bring_to_front(hwnd: Hwnd) -> bool {
+        // SAFETY: plain window and thread handles; a stale one just fails.
+        unsafe {
+            let front = GetForegroundWindow();
+            if front == hwnd {
+                return true;
+            }
+            let me = GetCurrentThreadId();
+            let front_thread = if front.is_null() {
+                0
+            } else {
+                GetWindowThreadProcessId(front, std::ptr::null_mut())
+            };
+            let attached = front_thread != 0 && front_thread != me && {
+                AttachThreadInput(me, front_thread, 1) != 0
+            };
+            SetForegroundWindow(hwnd);
+            if attached {
+                AttachThreadInput(me, front_thread, 0);
+            }
+            GetForegroundWindow() == hwnd
+        }
+    }
+
+    /// A 1-pixel mouse move and back, then F15 down and up, as real input.
+    fn send_input() -> bool {
+        let mouse = |dx: i32| Input {
+            kind: INPUT_MOUSE,
+            body: InputUnion {
+                mouse: MouseInput {
+                    dx,
+                    dy: 0,
+                    data: 0,
+                    flags: MOUSEEVENTF_MOVE,
+                    time: 0,
+                    extra: 0,
+                },
+            },
+        };
+        let key = |flags: u32| Input {
+            kind: INPUT_KEYBOARD,
+            body: InputUnion {
+                key: KeyInput {
+                    vk: super::VK_F15 as u16,
+                    scan: super::SCAN_F15 as u16,
+                    flags,
+                    time: 0,
+                    extra: 0,
+                },
+            },
+        };
+        let inputs = [mouse(1), mouse(-1), key(0), key(KEYEVENTF_KEYUP)];
+        // SAFETY: the array lives for the call and the size is that of `Input`.
+        let sent = unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<Input>() as i32,
+            )
+        };
+        sent as usize == inputs.len()
+    }
+
+    /// Bring each window forward in turn, send it input, and put the window that
+    /// was in front before back. Returns (windows reached, windows that could
+    /// not be brought forward).
+    pub(super) fn focus_pulse(handles: &[isize]) -> (usize, usize) {
+        if handles.is_empty() {
+            return (0, 0);
+        }
+        wait_for_quiet();
+
+        // SAFETY: no arguments; the result is only compared and handed back.
+        let previous = unsafe { GetForegroundWindow() };
+        let mut reached = 0;
+        let mut not_focused = 0;
+
+        for handle in handles {
+            let hwnd = *handle as Hwnd;
+            // A minimized window cannot be given the focus.
+            // SAFETY: a stale handle just fails.
+            let minimized = unsafe { IsIconic(hwnd) } != 0;
+            if minimized {
+                // SAFETY: as above.
+                unsafe {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+
+            if bring_to_front(hwnd) {
+                // The window needs a moment to become active and, afterwards, to
+                // read what it was sent.
+                std::thread::sleep(Duration::from_millis(80));
+                if send_input() {
+                    reached += 1;
+                }
+                std::thread::sleep(Duration::from_millis(120));
+            } else {
+                not_focused += 1;
+            }
+
+            if minimized {
+                // SAFETY: as above.
+                unsafe {
+                    ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+                }
+            }
+        }
+
+        if !previous.is_null() {
+            bring_to_front(previous);
+        }
+        (reached, not_focused)
+    }
 }
 
 #[cfg(not(windows))]
 mod win {
     pub(super) fn nudge(_handle: isize) -> bool {
         false
+    }
+
+    pub(super) fn focus_pulse(_handles: &[isize]) -> (usize, usize) {
+        (0, 0)
     }
 }
 
@@ -232,14 +582,66 @@ mod tests {
 
     #[test]
     fn a_pulse_without_clients_reaches_nobody() {
-        assert_eq!(pulse(), 0);
+        for mode in Mode::variants() {
+            let report = pulse(mode);
+            assert_eq!((report.windows, report.reached), (0, 0));
+            assert!(!report.is_ok());
+        }
+        assert!(take_report().is_some(), "the round leaves a report");
+        assert!(take_report().is_none(), "and it is handed out only once");
     }
 
     #[test]
     fn settings_are_clamped_when_applied() {
-        configure(false, 500);
+        configure(false, 500, Mode::Quiet);
         assert_eq!(MINUTES.load(Ordering::Relaxed), MAX_MINUTES);
-        configure(false, DEFAULT_MINUTES);
+        assert_eq!(Mode::from_u8(MODE.load(Ordering::Relaxed)), Mode::Quiet);
+        configure(false, DEFAULT_MINUTES, Mode::Focus);
         assert!(!ENABLED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn the_mode_survives_its_stored_form_and_defaults_to_focus() {
+        for mode in Mode::variants() {
+            assert_eq!(Mode::from_u8(mode.to_u8()), mode);
+        }
+        assert_eq!(Mode::default(), Mode::Focus);
+        assert_eq!(Mode::from_u8(200), Mode::Focus);
+    }
+
+    #[test]
+    fn the_report_says_what_was_reached() {
+        let all = Report {
+            mode: Mode::Focus,
+            windows: 3,
+            reached: 3,
+            not_focused: 0,
+        };
+        assert!(all.is_ok());
+        assert_eq!(all.text(), "Анти-AFK: ввод отправлен в окон 3 из 3");
+
+        let part = Report {
+            reached: 1,
+            not_focused: 2,
+            ..all
+        };
+        assert!(!part.is_ok());
+        assert!(part.text().contains("1 из 3"));
+        assert!(part.text().contains("не вышли вперёд: 2"));
+
+        let none = Report {
+            windows: 0,
+            reached: 0,
+            ..all
+        };
+        assert!(none.text().contains("не найдено"));
+    }
+
+    #[test]
+    fn the_user_counts_as_still_after_a_pause() {
+        assert!(!is_quiet(0));
+        assert!(!is_quiet(QUIET_MS - 1));
+        assert!(is_quiet(QUIET_MS));
+        assert!(is_quiet(60_000));
     }
 }
