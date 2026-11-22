@@ -30,8 +30,8 @@ jobs:
     runs-on: windows-latest
     env:
       # Passed through the environment, never pasted into a script: a tag name
-      # is user input.
-      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      # is user input. The normalized name is RELEASE_TAG, set by the first step.
+      INPUT_TAG: ${{ github.event.inputs.tag || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -39,16 +39,20 @@ jobs:
       - name: Check the tag against Cargo.toml
         shell: pwsh
         run: |
-          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
-            throw "Tag '$($env:TAG)' is not like v1.2.3 or v1.2.3-rc.1"
+          # "0.6.0" typed into a manual run is taken as "v0.6.0".
+          $tag = $env:INPUT_TAG.Trim()
+          if ($tag -match '^\d') { $tag = "v$tag" }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+            throw "Tag '$tag' is not like v1.2.3 or v1.2.3-rc.1"
           }
           $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
             Select-Object -First 1
           $version = $line.Matches[0].Groups[1].Value
-          if ($env:TAG -ne "v$version") {
-            throw "Tag '$($env:TAG)' does not match version $version in Cargo.toml"
+          if ($tag -ne "v$version") {
+            throw "Tag '$tag' does not match version $version in Cargo.toml"
           }
-          Write-Host "Releasing $($env:TAG)"
+          Write-Host "Releasing $tag"
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -77,15 +81,15 @@ jobs:
           $assets = @('dist/rbm.exe', 'dist/rbm.exe.sha256')
 
           # A re-run for the same tag replaces the files instead of failing.
-          gh release view $env:TAG *> $null
+          gh release view $env:RELEASE_TAG *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG @assets --clobber
+            gh release upload $env:RELEASE_TAG @assets --clobber
           } else {
             $flags = @()
             # v1.2.3-rc.1 and the like are not offered as the latest release.
-            if ($env:TAG.Contains('-')) { $flags += '--prerelease' }
-            gh release create $env:TAG @assets `
-              --title $env:TAG `
+            if ($env:RELEASE_TAG.Contains('-')) { $flags += '--prerelease' }
+            gh release create $env:RELEASE_TAG @assets `
+              --title $env:RELEASE_TAG `
               --generate-notes `
               --target $env:GITHUB_SHA `
               @flags
