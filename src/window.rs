@@ -15,6 +15,10 @@
 //! game then renders into a smaller area; the client logs `dims=800x599` for its
 //! own swapchain but the window really is smaller.
 
+// Wayland gives no client the ability to place another client's window, and a
+// Flatpak sandbox adds another wall. Every helper below is a stub off Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -29,9 +33,35 @@ const PIN_POLL: Duration = Duration::from_millis(400);
 
 /// How long the grid keeps arranging windows after the last launch. A place load
 /// can move the game into another process, so a few passes are needed.
+#[cfg(windows)]
 const TILE_FOR: Duration = Duration::from_secs(45);
-/// How often the grid is re-applied while active.
+/// How often the grid is re-applied while active. Cheap on Windows: one
+/// enumeration of the window list.
+#[cfg(windows)]
 const TILE_POLL: Duration = Duration::from_millis(700);
+
+/// KWin applies a layout asynchronously; a handful of passes is enough there.
+#[cfg(not(windows))]
+const TILE_FOR: Duration = Duration::from_secs(20);
+/// Each KWin pass is a D-Bus call plus a journal read, so it is not free.
+#[cfg(not(windows))]
+const TILE_POLL: Duration = Duration::from_secs(3);
+
+/// Whether this platform lets the manager place game windows at all.
+pub fn arrange_supported() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::kwin::available()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
 
 /// Keep every window of the client at a `width`x`height` **client area**.
 /// Runs on a short-lived thread: the client needs a moment to create the window,
@@ -98,6 +128,9 @@ static TILE_STARTED: OnceLock<()> = OnceLock::new();
 /// [`TILE_FOR`], because the client moves its window while a place loads.
 /// Cheap enough to call on every launch.
 pub fn arrange() {
+    if !arrange_supported() {
+        return;
+    }
     {
         let Ok(mut until) = TILE_UNTIL.lock() else {
             return;
@@ -130,6 +163,34 @@ fn tile_loop() {
             std::thread::sleep(Duration::from_millis(300));
         }
     }
+}
+
+/// Rows and columns that give each window the closest shape to the screen.
+///
+/// Six windows on a 16:9 screen become 3x2, four become 2x2, three stay in
+/// one row. The caller passes what is actually running, so the grid follows
+/// the number of accounts instead of a fixed preset.
+fn grid(count: usize, screen_width: i32, screen_height: i32) -> (usize, usize) {
+    if count <= 1 {
+        return (1, 1);
+    }
+    let aspect = screen_width.max(1) as f32 / screen_height.max(1) as f32;
+
+    let mut best = (count, 1);
+    let mut best_score = f32::MAX;
+    for rows in 1..=count {
+        let cols = count.div_ceil(rows);
+        let cell = aspect / (cols as f32 / rows as f32);
+        // Prefer square-ish cells, and a grid that is exactly full.
+        let waste = (rows * cols - count) as f32;
+        let score = (cell.max(1.0 / cell)).ln().abs() + waste * 0.15;
+        if score < best_score {
+            best_score = score;
+            best = (rows, cols);
+        }
+    }
+    // `best` is (rows, cols); the callers read it as (columns, rows).
+    (best.1, best.0)
 }
 
 #[cfg(windows)]
@@ -286,34 +347,6 @@ mod win {
         rect
     }
 
-    /// Rows and columns that give each window the closest shape to the screen.
-    ///
-    /// Six windows on a 16:9 screen become 3x2, four become 2x2, three stay in
-    /// one row. The caller passes what is actually running, so the grid follows
-    /// the number of accounts instead of a fixed preset.
-    pub(super) fn grid(count: usize, screen_width: i32, screen_height: i32) -> (usize, usize) {
-        if count <= 1 {
-            return (1, 1);
-        }
-        let aspect = screen_width.max(1) as f32 / screen_height.max(1) as f32;
-
-        let mut best = (count, 1);
-        let mut best_score = f32::MAX;
-        for rows in 1..=count {
-            let cols = count.div_ceil(rows);
-            let cell = aspect / (cols as f32 / rows as f32);
-            // Prefer square-ish cells, and a grid that is exactly full.
-            let waste = (rows * cols - count) as f32;
-            let score = (cell.max(1.0 / cell)).ln().abs() + waste * 0.15;
-            if score < best_score {
-                best_score = score;
-                best = (rows, cols);
-            }
-        }
-        // `best` is (rows, cols); the callers read it as (columns, rows).
-        (best.1, best.0)
-    }
-
     /// The game window of every client process: one per process, the largest.
     fn game_windows() -> Vec<Found> {
         let mut list = Collect { found: Vec::new() };
@@ -386,7 +419,7 @@ mod win {
         windows.sort_by_key(|found| found.pid);
 
         let area = work_area();
-        let (columns, rows) = grid(
+        let (columns, rows) = super::grid(
             windows.len(),
             area.right - area.left,
             area.bottom - area.top,
@@ -465,35 +498,6 @@ mod win {
             SetWindowPos(hwnd, std::ptr::null_mut(), x, y, outer_w, outer_h, flags);
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::grid;
-
-        #[test]
-        fn one_window_fills_the_screen() {
-            assert_eq!(grid(1, 1920, 1080), (1, 1));
-        }
-
-        #[test]
-        fn six_windows_become_three_by_two() {
-            // Six accounts on a 16:9 screen: two rows of three keeps the cells
-            // wider than tall, which is what the client draws best.
-            assert_eq!(grid(6, 1920, 1080), (3, 2));
-        }
-
-        #[test]
-        fn four_windows_become_a_square() {
-            assert_eq!(grid(4, 1920, 1080), (2, 2));
-        }
-
-        #[test]
-        fn five_windows_fill_the_first_row_first() {
-            let (columns, rows) = grid(5, 1920, 1080);
-            assert!(columns * rows >= 5, "{columns}x{rows}");
-            assert!((columns * rows - 5) <= 1, "{columns}x{rows}");
-        }
-    }
 }
 
 #[cfg(not(windows))]
@@ -502,7 +506,24 @@ mod win {
         0
     }
 
-    pub(super) fn tile_all() {}
+    /// KWin owns the windows; the manager only asks it for a grid.
+    pub(super) fn tile_all() {
+        #[cfg(target_os = "linux")]
+        {
+            let windows = crate::kwin::windows();
+            if windows.is_empty() {
+                return;
+            }
+            let area = crate::kwin::work_area().unwrap_or(crate::kwin::Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1040,
+            });
+            let (columns, rows) = super::grid(windows.len(), area.width, area.height);
+            crate::kwin::tile(columns, rows);
+        }
+    }
 
     pub(super) fn game_window_handles() -> Vec<isize> {
         Vec::new()
@@ -510,5 +531,34 @@ mod win {
 
     pub(super) fn apply_size_now(_width: u32, _height: u32) -> Vec<(u32, u32)> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grid;
+
+    #[test]
+    fn one_window_fills_the_screen() {
+        assert_eq!(grid(1, 1920, 1080), (1, 1));
+    }
+
+    #[test]
+    fn six_windows_become_three_by_two() {
+        // Six accounts on a 16:9 screen: two rows of three keeps the cells
+        // wider than tall, which is what the client draws best.
+        assert_eq!(grid(6, 1920, 1080), (3, 2));
+    }
+
+    #[test]
+    fn four_windows_become_a_square() {
+        assert_eq!(grid(4, 1920, 1080), (2, 2));
+    }
+
+    #[test]
+    fn five_windows_fill_the_first_row_first() {
+        let (columns, rows) = grid(5, 1920, 1080);
+        assert!(columns * rows >= 5, "{columns}x{rows}");
+        assert!((columns * rows - 5) <= 1, "{columns}x{rows}");
     }
 }

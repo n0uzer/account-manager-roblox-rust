@@ -32,6 +32,8 @@ pub enum LaunchKind {
     Deeplink,
     /// Direct `RobloxPlayerBeta.exe --app`: always spawns a new window.
     NewWindow,
+    /// Sober with the account's own `HOME`: a separate instance every time.
+    Sober,
 }
 
 impl LaunchKind {
@@ -39,6 +41,7 @@ impl LaunchKind {
         match self {
             LaunchKind::Deeplink => "через deeplink",
             LaunchKind::NewWindow => "отдельное окно (--app)",
+            LaunchKind::Sober => "профиль Sober",
         }
     }
 }
@@ -67,16 +70,16 @@ pub struct Limits {
 }
 
 impl Limits {
-    fn has_settings(self) -> bool {
+    pub(crate) fn has_settings(self) -> bool {
         self.fps_cap > 0 || self.quality > 0 || self.texture.is_some() || self.extras.any()
     }
 
-    fn has_size(self) -> bool {
+    pub(crate) fn has_size(self) -> bool {
         self.width > 0 && self.height > 0
     }
 
     /// Human-readable list of what was written into the client settings.
-    fn settings_note(self) -> String {
+    pub(crate) fn settings_note(self) -> String {
         let mut parts = Vec::new();
         if self.fps_cap > 0 {
             parts.push(format!("FPS {}", self.fps_cap));
@@ -567,7 +570,7 @@ pub fn build_job_join_url(place_id: u64, job_id: &str, tracker: u64) -> String {
 ///
 /// The sharelinks endpoint needs an authenticated session, so the launching
 /// account's cookie is used — it is the same account that joins a second later.
-fn resolve_share_link(code: &str, cookie: &str) -> Result<(u64, String), String> {
+pub(crate) fn resolve_share_link(code: &str, cookie: &str) -> Result<(u64, String), String> {
     let body = serde_json::json!({ "linkId": code, "linkType": "Server" });
     let mut token: Option<String> = None;
 
@@ -839,8 +842,13 @@ fn spawn_new_window(
 
 /// Launch the game for one account.
 ///
-/// * `multi == false` — system `roblox-player:` handler, single window.
-/// * `multi == true`  — direct client start with `--app`, new window every call.
+/// Windows (`multi`):
+/// * `false` — system `roblox-player:` handler, single window.
+/// * `true`  — direct client start with `--app`, new window every call.
+///
+/// Linux: `account_id` names the account's own Sober profile, so every launch is
+/// a separate instance and `multi` has nothing to decide; the details live in
+/// [`crate::sober::launch_game`].
 ///
 /// The FPS cap and the start window size go into the client's own settings file
 /// (`GlobalBasicSettings_13.xml`), which is where the in-game menu writes them.
@@ -849,6 +857,31 @@ fn spawn_new_window(
 /// rewritten before every launch. The window size is also enforced afterwards,
 /// because the client may restore its own size while loading.
 pub fn launch_game(
+    account_id: &str,
+    place: Destination,
+    cookie: &str,
+    multi: bool,
+    limits: Limits,
+) -> Result<LaunchOutcome, String> {
+    #[cfg(windows)]
+    {
+        let _ = account_id;
+        launch_game_windows(place, cookie, multi, limits)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = multi;
+        crate::sober::launch_game(account_id, place, cookie, limits)
+    }
+}
+
+/// Windows: ticket plus the installed player, either through the protocol
+/// handler or as a direct `--app` window.
+///
+/// Kept compiled on Linux too: the branch is dead there, but it still has to
+/// type-check, and one attribute is cheaper than gating every helper.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn launch_game_windows(
     place: Destination,
     cookie: &str,
     multi: bool,
@@ -959,7 +992,7 @@ pub fn launch_game(
 }
 
 /// First eight characters of a Job ID, enough to tell two servers apart.
-fn short_job(job_id: &str) -> String {
+pub(crate) fn short_job(job_id: &str) -> String {
     job_id.chars().take(8).collect()
 }
 

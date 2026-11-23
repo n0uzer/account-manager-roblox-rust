@@ -97,6 +97,13 @@ impl Tracker {
             .map(|live| live.pid)
     }
 
+    /// Pids of the windows the manager opened itself. A targeted close uses
+    /// this on Linux, where a Flatpak instance does not expose its `HOME`.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn window_pids(&self) -> Vec<u32> {
+        self.live.iter().map(|live| live.pid).collect()
+    }
+
     #[cfg(test)]
     pub fn live_count(&self) -> usize {
         self.live.len()

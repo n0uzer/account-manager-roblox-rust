@@ -399,6 +399,32 @@ impl App {
             kill_armed: None,
         };
 
+        // Linux: one Sober profile per account is how a second window is even
+        // possible, so "several windows" is not a mode there but the only way
+        // the client runs.
+        #[cfg(not(windows))]
+        {
+            app.config.multi_instance = true;
+            // Wayland has no quiet mode: every pulse takes the focus for a
+            // moment, so a mode saved on Windows must not leak into this run.
+            app.config.anti_afk_mode = antiafk::Mode::Focus;
+            // Profiles left by an earlier run may still hold a plaintext
+            // session cookie; the encrypted store is the only copy we keep.
+            crate::sober::purge_all();
+            if !crate::sober::installed() {
+                app.warn(
+                    "Sober не найден: установи flatpak org.vinegarhq.Sober системно \
+                     (flatpak install flathub org.vinegarhq.Sober)",
+                );
+            }
+        }
+
+        // The grid needs a compositor that lets a script place windows. A config
+        // copied from a KWin desktop must not leave a no-op switch on.
+        if !window::arrange_supported() {
+            app.config.tile_windows = false;
+        }
+
         // Claim the client's single-instance names before any launch, so that
         // extra windows are not closed by the client itself.
         if app.config.multi_instance {
@@ -628,6 +654,10 @@ impl App {
 
     /// Drop the store (key and cookies are zeroized on drop).
     fn lock_with(&mut self, reason: &str) {
+        // The profiles still hold copies of the session cookies in plain text;
+        // a locked manager must not leave them usable.
+        #[cfg(not(windows))]
+        crate::sober::purge_all();
         self.store = None;
         self.selected = None;
         self.launch_set.clear();
@@ -728,20 +758,25 @@ impl App {
                         }
                     });
 
-                    let mut dpapi = self
-                        .store
-                        .as_ref()
-                        .map(|store| store.dpapi)
-                        .unwrap_or(false);
-                    if ui
-                        .checkbox(&mut dpapi, "Привязка к Windows (DPAPI)")
-                        .on_hover_text(
-                            "Файл можно будет открыть только под этим пользователем Windows. \
-                             Экспорт такого файла на другой ПК не сработает.",
-                        )
-                        .changed()
+                    // DPAPI is a Windows facility; on Linux the store is
+                    // protected by the password alone, so the switch is hidden.
+                    #[cfg(windows)]
                     {
-                        self.toggle_dpapi(dpapi);
+                        let mut dpapi = self
+                            .store
+                            .as_ref()
+                            .map(|store| store.dpapi)
+                            .unwrap_or(false);
+                        if ui
+                            .checkbox(&mut dpapi, "Привязка к Windows (DPAPI)")
+                            .on_hover_text(
+                                "Файл можно будет открыть только под этим пользователем Windows. \
+                                 Экспорт такого файла на другой ПК не сработает.",
+                            )
+                            .changed()
+                        {
+                            self.toggle_dpapi(dpapi);
+                        }
                     }
 
                     ui.separator();
@@ -931,15 +966,28 @@ impl App {
                 self.launch_batch();
             }
 
-            if ui
-                .checkbox(&mut self.config.multi_instance, "Несколько окон")
-                .on_hover_text(
-                    "Каждый аккаунт открывается в отдельном окне клиента (--app).\n\
-                     Без галочки запуск идёт через deeplink: окно одно.",
+            if cfg!(windows) {
+                if ui
+                    .checkbox(&mut self.config.multi_instance, "Несколько окон")
+                    .on_hover_text(
+                        "Каждый аккаунт открывается в отдельном окне клиента (--app).\n\
+                         Без галочки запуск идёт через deeplink: окно одно.",
+                    )
+                    .changed()
+                {
+                    self.save_config();
+                }
+            } else {
+                // Every account already has its own Sober profile, so a second
+                // window is the rule rather than an option.
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut true, "Несколько окон"),
                 )
-                .changed()
-            {
-                self.save_config();
+                .on_disabled_hover_text(
+                    "На Linux у каждого аккаунта свой профиль Sober (свой HOME), \
+                     поэтому окна всегда отдельные — эта настройка не нужна.",
+                );
             }
 
             ui.add_enabled_ui(self.config.multi_instance, |ui| {
@@ -1072,8 +1120,10 @@ impl App {
                          0 в ширине или высоте — окно обычного размера.",
                     );
 
-                    let can_apply =
-                        !tiled && self.config.window_width > 0 && self.config.window_height > 0;
+                    let can_apply = cfg!(windows)
+                        && !tiled
+                        && self.config.window_width > 0
+                        && self.config.window_height > 0;
                     if ui
                         .add_enabled(can_apply, egui::Button::new("применить сейчас").small())
                         .on_hover_text(
@@ -1081,26 +1131,48 @@ impl App {
                              получился. Без этого размер ставится только при запуске и \
                              держится первые 90 секунд.",
                         )
-                        .on_disabled_hover_text(
-                            "Нужны ширина и высота больше нуля и выключенная «Раскладка сеткой»",
-                        )
+                        .on_disabled_hover_text(if cfg!(windows) {
+                            "Нужны ширина и высота больше нуля и выключенная «Раскладка сеткой»"
+                        } else {
+                            "На Linux размер ставится при запуске: окно Sober подхватывает \
+                             его из настроек клиента и менять на ходу не нужно"
+                        })
                         .clicked()
                     {
                         apply_now = true;
                     }
 
                     ui.add_space(6.0);
+                    let tile_supported = window::arrange_supported();
+                    let tile_hint = if cfg!(windows) {
+                        "Все окна клиента раскладываются по экрану сеткой: 2 окна — рядом, \
+                         4 — 2×2, 6 — 3×2, и так далее.\n\
+                         Размер ячейки считается от рабочей области экрана (без панели \
+                         задач), поэтому окна занимают весь монитор и не перекрывают \
+                         друг друга.\n\
+                         Клиент обычно не даёт окно меньше 800×600 — менеджер обходит это \
+                         ограничение, поэтому 6 окон реально помещаются на одном экране.\n\
+                         Позиция и размер пересчитываются после каждого запуска."
+                    } else {
+                        "Все окна Sober раскладываются по экрану сеткой: 2 окна — рядом, \
+                         4 — 2×2, 6 — 3×2, и так далее.\n\
+                         Раскладку выполняет KWin по просьбе менеджера: под Wayland \
+                         приложение не может двигать чужие окна само.\n\
+                         Размер ячейки считается от рабочей области экрана (без панели \
+                         задач). Полноэкранные окна Sober для сетки переводятся в оконный \
+                         режим.\n\
+                         Позиция и размер пересчитываются после каждого запуска и по \
+                         кнопке «разложить сейчас»."
+                    };
                     if ui
-                        .checkbox(&mut self.config.tile_windows, "Раскладка сеткой")
-                        .on_hover_text(
-                            "Все окна клиента раскладываются по экрану сеткой: 2 окна — рядом, \
-                             4 — 2×2, 6 — 3×2, и так далее.\n\
-                             Размер ячейки считается от рабочей области экрана (без панели \
-                             задач), поэтому окна занимают весь монитор и не перекрывают \
-                             друг друга.\n\
-                             Клиент обычно не даёт окно меньше 800×600 — менеджер обходит это \
-                             ограничение, поэтому 6 окон реально помещаются на одном экране.\n\
-                             Позиция и размер пересчитываются после каждого запуска.",
+                        .add_enabled(
+                            tile_supported,
+                            egui::Checkbox::new(&mut self.config.tile_windows, "Раскладка сеткой"),
+                        )
+                        .on_hover_text(tile_hint)
+                        .on_disabled_hover_text(
+                            "Композитор не KWin. Под Wayland менеджер не двигает чужие \
+                             окна: сетку раскладывает сам композитор.",
                         )
                         .changed()
                     {
@@ -1108,8 +1180,14 @@ impl App {
                     }
 
                     if ui
-                        .small_button("разложить сейчас")
+                        .add_enabled(
+                            tile_supported,
+                            egui::Button::new("разложить сейчас").small(),
+                        )
                         .on_hover_text("Пересчитать сетку по уже открытым окнам")
+                        .on_disabled_hover_text(
+                            "Нужен KWin: под другим композитором окна расставляет он сам",
+                        )
                         .clicked()
                     {
                         window::arrange();
@@ -1149,15 +1227,32 @@ impl App {
                     );
             }
 
+            // Windows empties a working set; Linux writes `memory.reclaim` on
+            // the cgroup of the instance. Both leave the processes alive.
+            let memory_supported = memory::supported();
+            let memory_hint = if cfg!(windows) {
+                "Раз в 20 секунд отдаёт системе память фоновых окон клиента \
+                 (EmptyWorkingSet). Окно в фокусе не трогается, поэтому игра, \
+                 в которой ты сейчас, не тормозит.\n\
+                 Процессы не закрываются: их страницы уходят в подкачку и \
+                 возвращаются в память по мере надобности."
+            } else {
+                "Раз в 20 секунд просит ядро освободить память фоновых окон Sober: \
+                 в cgroup каждого профиля пишется memory.reclaim (около восьмой части \
+                 занятого, от 32 до 512 МБ).\n\
+                 Окно в фокусе пропускается, поэтому игра, в которой ты сейчас, не \
+                 платит за возврат страниц. Клиент не закрывается и не замораживается: \
+                 страницы читаются обратно по мере надобности.\n\
+                 Так освобождается и кэш, и неиспользуемая память движка — это работает \
+                 даже внутри песочницы Flatpak. Нужен cgroup v2 (на этой системе — есть)."
+            };
             if ui
-                .checkbox(&mut self.config.trim_memory, "Экономить ОЗУ")
-                .on_hover_text(
-                    "Раз в 30 секунд отдаёт системе память фоновых окон клиента \
-                     (EmptyWorkingSet). Окно в фокусе не трогается, поэтому игра, \
-                     в которой ты сейчас, не тормозит.\n\
-                     Процессы не закрываются: их страницы уходят в подкачку и \
-                     возвращаются в память по мере надобности.",
+                .add_enabled(
+                    memory_supported,
+                    egui::Checkbox::new(&mut self.config.trim_memory, "Экономить ОЗУ"),
                 )
+                .on_hover_text(memory_hint)
+                .on_disabled_hover_text("Нужен cgroup v2 с контроллером памяти")
                 .changed()
             {
                 if self.config.trim_memory {
@@ -1167,6 +1262,7 @@ impl App {
             }
 
             if self.config.trim_memory
+                && memory_supported
                 && ui
                     .small_button("сейчас")
                     .on_hover_text("Освободить память фоновых окон прямо сейчас")
@@ -2118,6 +2214,12 @@ impl App {
             if let Some(store) = self.store.as_mut() {
                 store.remove(&id);
             }
+            // The Sober profile carries the account's cookies and settings;
+            // leaving it behind would leave a plaintext session on disk.
+            #[cfg(not(windows))]
+            if let Err(message) = crate::sober::remove_profile(&id) {
+                self.warn(message);
+            }
             match self.persist() {
                 Some(err) => self.fail(format!("Ошибка сохранения: {err}")),
                 None => self.info(format!("Удалено: {label}")),
@@ -2173,10 +2275,12 @@ impl App {
                 let warn = Tone::Warn.color(ui);
                 match dialog.kind {
                     TransferKind::Export => {
-                        ui.colored_label(
-                            warn,
-                            "Файл копируется как есть: тот же пароль, та же привязка к Windows.",
-                        );
+                        let note = if cfg!(windows) {
+                            "Файл копируется как есть: тот же пароль, та же привязка к Windows."
+                        } else {
+                            "Файл копируется как есть: тот же пароль. Привязки к машине в нём нет."
+                        };
+                        ui.colored_label(warn, note);
                     }
                     TransferKind::Import => {
                         ui.label("Пароль импортируемого файла");
@@ -2782,6 +2886,7 @@ impl App {
         self.set_clipboard(&cookie);
     }
 
+    #[cfg(windows)]
     fn toggle_dpapi(&mut self, enabled: bool) {
         let Some(store) = self.store.as_mut() else {
             return;
@@ -2794,12 +2899,7 @@ impl App {
     }
 
     fn open_transfer(&mut self, kind: TransferKind) {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let path = if home.is_empty() {
-            "rbx-accounts.dat".to_string()
-        } else {
-            format!("{home}\\Desktop\\rbx-accounts.dat")
-        };
+        let path = desktop_file("rbx-accounts.dat");
 
         self.transfer = Some(Transfer {
             kind,
@@ -3086,6 +3186,12 @@ impl App {
 }
 
 impl eframe::App for App {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Closing the window must not leave a plaintext session behind.
+        #[cfg(not(windows))]
+        crate::sober::purge_all();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Order matters: check the idle timeout *before* this frame's input
         // refreshes the activity stamp.
@@ -3146,6 +3252,33 @@ fn number(
             .speed(1.0)
             .suffix(suffix),
     )
+}
+
+/// A file on the user's desktop, or in the home directory when there is no
+/// desktop folder: the export dialog starts with a usable path instead of an
+/// empty box.
+fn desktop_file(name: &str) -> String {
+    #[cfg(windows)]
+    {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        return if home.is_empty() {
+            name.to_string()
+        } else {
+            format!("{home}\\Desktop\\{name}")
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return name.to_string();
+        };
+        let desktop = home.join("Desktop");
+        if desktop.is_dir() {
+            desktop.join(name).display().to_string()
+        } else {
+            home.join(name).display().to_string()
+        }
+    }
 }
 
 /// Whether the value should be written to disk right away.

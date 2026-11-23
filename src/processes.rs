@@ -3,6 +3,10 @@
 //! The client can move its game window into a process started after the one we
 //! spawned, so the manager has to look at processes, not at a single pid. Both
 //! the window pinner and the memory trimmer need this list.
+//!
+//! On Linux the client is Sober, and one account is one Flatpak instance: the
+//! app runs several `sober` processes that all share its cgroup scope, so the
+//! scan groups them and reports one entry per instance.
 
 /// Executable name of the game client.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -14,6 +18,7 @@ pub fn client_pids() -> Vec<u32> {
 }
 
 /// Ids of client processes started at or after `since`, a FILETIME tick count.
+#[allow(dead_code)]
 pub fn client_pids_started_after(since: u64) -> Vec<u32> {
     win::client_pids(since)
 }
@@ -25,8 +30,16 @@ pub fn now_filetime() -> u64 {
 }
 
 /// Pid that owns the foreground window, if any.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn foreground_pid() -> Option<u32> {
     win::foreground_pid()
+}
+
+/// Linux cgroup v2 path of the instance `pid` belongs to, without the
+/// `/sys/fs/cgroup` prefix: `/user.slice/.../app-flatpak-org.vinegarhq.Sober-…`.
+/// `None` on Windows and for a process that has already gone.
+pub fn cgroup_path(pid: u32) -> Option<String> {
+    win::cgroup_path(pid)
 }
 
 /// A running client process and when it was created.
@@ -50,18 +63,12 @@ pub fn kill(pids: &[u32]) -> usize {
     let running = client_pids();
     pids.iter()
         .filter(|pid| running.contains(pid))
-        .filter(|pid| {
-            crate::roblox::run_hidden(std::process::Command::new("taskkill").args([
-                "/F",
-                "/PID",
-                &pid.to_string(),
-            ]))
-            .is_some()
-        })
+        .filter(|pid| win::kill_instance(**pid))
         .count()
 }
 
 /// End every client window. Returns how many were ended.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn kill_all() -> usize {
     kill(&client_pids())
 }
@@ -217,24 +224,242 @@ mod win {
         unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
         (pid != 0).then_some(pid)
     }
+
+    pub(super) fn cgroup_path(_pid: u32) -> Option<String> {
+        None
+    }
+
+    /// `taskkill /F` on the pid the tracker holds for the window.
+    pub(super) fn kill_instance(pid: u32) -> bool {
+        crate::roblox::run_hidden(std::process::Command::new("taskkill").args([
+            "/F",
+            "/PID",
+            &pid.to_string(),
+        ]))
+        .is_some()
+    }
 }
 
+/// Linux: the game runs inside Flatpak, so `/proc` is the whole story.
+///
+/// One Sober instance is several processes (`sober`, a render helper, `bwrap`
+/// supervisors) in one systemd scope named after the app. Grouping by cgroup is
+/// what turns them back into "one window"; the leader (`pid == session`) is the
+/// process the tracker remembers and the one a later kill is aimed at.
 #[cfg(not(windows))]
 mod win {
-    pub(super) fn client_pids(_since: u64) -> Vec<u32> {
-        Vec::new()
+    use std::collections::HashMap;
+    use std::fs;
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `USER_HZ` is 100 on every Linux ABI Rust builds for.
+    const HZ: u64 = 100;
+    const TICKS: u64 = 10_000_000;
+    /// Substring of every cgroup that belongs to the Sober sandbox.
+    const CGROUP_MARK: &str = "app-flatpak-org.vinegarhq.Sober";
+    /// Processes that make up the app itself, as opposed to helpers that only
+    /// borrow its cgroup (a login window, for instance, is one of ours too).
+    const APP_COMMS: [&str; 3] = ["sober", "sober_services", "bwrap"];
+
+    extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+
+    const SIGTERM: i32 = 15;
+
+    /// One Sober instance found in `/proc`.
+    struct Instance {
+        /// Pid that leads the instance, or the oldest `sober` process in it.
+        leader: u32,
+        /// FILETIME ticks of the leader's creation.
+        created: u64,
+        /// True when the leader is the app's session leader.
+        main: bool,
+    }
+
+    fn read_trimmed(path: String) -> Option<String> {
+        let text = fs::read_to_string(path).ok()?;
+        Some(text.trim_end().to_string())
+    }
+
+    /// First line of `/proc/<pid>/cgroup`: `0::/user.slice/...scope`.
+    fn cgroup_of(pid: u32) -> Option<String> {
+        let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        text.lines().next().map(|line| line.trim().to_string())
+    }
+
+    /// The same line without the `0::` prefix: the path below the cgroup root.
+    pub(super) fn cgroup_path(pid: u32) -> Option<String> {
+        let line = cgroup_of(pid)?;
+        let (_, path) = line.split_once("::")?;
+        (!path.is_empty()).then(|| path.to_string())
+    }
+
+    /// Fields after `(comm)` in `/proc/<pid>/stat`: state, ppid, pgrp, session…
+    fn stat_rest(pid: u32) -> Option<Vec<String>> {
+        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let close = text.rfind(')')?;
+        Some(
+            text[close + 1..]
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    /// Session id of the process, used to spot the instance's main process.
+    fn session_of(pid: u32) -> Option<u32> {
+        stat_rest(pid)?.get(3)?.parse().ok()
+    }
+
+    /// Start time in clock ticks since boot.
+    fn start_ticks(pid: u32) -> Option<u64> {
+        stat_rest(pid)?.get(19)?.parse().ok()
+    }
+
+    /// Seconds since boot, with the fraction `/proc/uptime` gives.
+    fn uptime_secs() -> f64 {
+        fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|text| {
+                text.split_whitespace()
+                    .next()
+                    .and_then(|first| first.parse().ok())
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// FILETIME ticks for a wall-clock instant, same base as the Windows code.
+    fn system_filetime() -> u64 {
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        since.as_secs() * TICKS + u64::from(since.subsec_nanos()) / 100 + 116_444_736_000_000_000
+    }
+
+    /// FILETIME ticks at boot. Taken once, then advanced with `/proc/uptime`,
+    /// which is monotonic and therefore can never disagree with a start time
+    /// taken from the same counter.
+    fn boot_filetime() -> u64 {
+        static BOOT: OnceLock<u64> = OnceLock::new();
+        *BOOT
+            .get_or_init(|| system_filetime().saturating_sub((uptime_secs() * TICKS as f64) as u64))
+    }
+
+    fn created_of(pid: u32) -> Option<u64> {
+        let ticks = start_ticks(pid)?;
+        Some(boot_filetime() + ticks * TICKS / HZ)
+    }
+
+    /// Every Sober instance on the machine, one entry each.
+    fn instances() -> Vec<Instance> {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+
+        let mut groups: HashMap<String, Instance> = HashMap::new();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+            else {
+                continue;
+            };
+            if read_trimmed(format!("/proc/{pid}/comm")).as_deref() != Some("sober") {
+                continue;
+            }
+            let Some(cgroup) = cgroup_of(pid) else {
+                continue;
+            };
+            if !cgroup.contains(CGROUP_MARK) {
+                continue;
+            }
+            let Some(created) = created_of(pid) else {
+                continue;
+            };
+            let main = session_of(pid) == Some(pid);
+
+            let seat = groups.entry(cgroup).or_insert(Instance {
+                leader: pid,
+                created,
+                main,
+            });
+            // The session leader wins; otherwise the oldest process does.
+            if (main && !seat.main) || (main == seat.main && created < seat.created) {
+                seat.leader = pid;
+                seat.created = created;
+                seat.main = main;
+            }
+        }
+
+        let mut list: Vec<Instance> = groups.into_values().collect();
+        list.sort_by_key(|instance| instance.created);
+        list
+    }
+
+    pub(super) fn client_pids(since: u64) -> Vec<u32> {
+        super::client_procs()
+            .into_iter()
+            .filter(|proc| since == 0 || proc.created >= since)
+            .map(|proc| proc.pid)
+            .collect()
     }
 
     pub(super) fn client_procs() -> Vec<super::Proc> {
-        Vec::new()
+        instances()
+            .into_iter()
+            .map(|instance| super::Proc {
+                pid: instance.leader,
+                created: instance.created,
+            })
+            .collect()
     }
 
     pub(super) fn now_filetime() -> u64 {
-        0
+        boot_filetime() + (uptime_secs() * TICKS as f64) as u64
     }
 
+    /// Wayland gives no global "active window"; KWin knows, but the pinner and
+    /// the Windows trimmer are the only callers and neither runs here.
+    #[allow(dead_code)]
     pub(super) fn foreground_pid() -> Option<u32> {
         None
+    }
+
+    /// End the whole instance the pid belongs to: the app spawns several
+    /// processes per window, and they all have to go for the window to close.
+    pub(super) fn kill_instance(pid: u32) -> bool {
+        let Some(cgroup) = cgroup_of(pid) else {
+            return false;
+        };
+        let mut hit = false;
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let Some(other) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok())
+                else {
+                    continue;
+                };
+                let Some(comm) = read_trimmed(format!("/proc/{other}/comm")) else {
+                    continue;
+                };
+                if !APP_COMMS.contains(&comm.as_str()) {
+                    continue;
+                }
+                if cgroup_of(other).as_deref() != Some(cgroup.as_str()) {
+                    continue;
+                }
+                // SAFETY: plain signal to a pid the kernel just showed us.
+                if unsafe { kill(other as i32, SIGTERM) } == 0 {
+                    hit = true;
+                }
+            }
+        }
+        hit
     }
 }
 

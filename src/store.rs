@@ -90,12 +90,27 @@ pub struct Store {
     pub accounts: Vec<Account>,
 }
 
-/// `%APPDATA%\RbxAccountManager`
+/// `%APPDATA%\RbxAccountManager` on Windows,
+/// `$XDG_DATA_HOME/RbxAccountManager` (usually `~/.local/share/...`) elsewhere.
 pub fn app_dir() -> PathBuf {
-    let base = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("RbxAccountManager")
+    #[cfg(windows)]
+    {
+        let base = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        return base.join("RbxAccountManager");
+    }
+    #[cfg(not(windows))]
+    {
+        let base = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        base.join("RbxAccountManager")
+    }
 }
 
 fn new_id() -> String {
@@ -203,6 +218,7 @@ impl Store {
     }
 
     /// Turn the DPAPI binding on or off and rewrite the file.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn set_dpapi(&mut self, enabled: bool) -> Result<(), String> {
         let previous = self.dpapi;
         self.dpapi = enabled;

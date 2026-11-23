@@ -44,7 +44,7 @@ pub fn apply(fps: u32, width: u32, height: u32) -> Result<bool, String> {
     apply_at(&path, fps, width, height)
 }
 
-fn apply_at(path: &Path, fps: u32, width: u32, height: u32) -> Result<bool, String> {
+pub(crate) fn apply_at(path: &Path, fps: u32, width: u32, height: u32) -> Result<bool, String> {
     let Ok(xml) = fs::read_to_string(path) else {
         // The client has never run on this machine: there is nothing to patch.
         return Ok(false);

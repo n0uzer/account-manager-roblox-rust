@@ -107,6 +107,15 @@ impl App {
 
     /// Close every Roblox client, ours or not.
     fn close_all_windows(&mut self) {
+        // A Sober instance does not expose its HOME, so the manager cannot tell
+        // its own profiles from a Sober the user started by hand. On Linux it
+        // closes only the windows it opened itself.
+        #[cfg(not(windows))]
+        let closed = {
+            let pids = self.tracker.window_pids();
+            processes::kill(&pids)
+        };
+        #[cfg(windows)]
         let closed = processes::kill_all();
         self.tracker.clear();
         self.relaunch.clear();
@@ -327,10 +336,24 @@ impl App {
     }
 
     fn anti_afk_controls(&mut self, ui: &mut egui::Ui) {
+        // Windows delivers the input with SendInput. Wayland only accepts input
+        // in the focused window, so Linux focuses each window in turn and taps
+        // a key from a virtual `uinput` keyboard. Both halves are required.
+        if !antiafk::supported() {
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, "Анти-AFK"))
+                .on_disabled_hover_text(if cfg!(windows) {
+                    "Синтетический ввод сейчас недоступен."
+                } else {
+                    "Нужны KWin и доступ к /dev/uinput: без них Wayland не пропустит \
+                     синтетический ввод в окно Sober. Проверь, что сессия — KDE Plasma \
+                     (Wayland) и что у пользователя есть права на /dev/uinput."
+                });
+            return;
+        }
         let mut changed = false;
         changed |= ui
             .checkbox(&mut self.config.anti_afk, "Анти-AFK")
-            .on_hover_text(
+            .on_hover_text(if cfg!(windows) {
                 "Раз в несколько минут отправляет в окна клиента лёгкий ввод — сдвиг мыши \
                  на пиксель и нажатие F15 — чтобы за простой не выкидывало (Roblox кикает \
                  примерно через 20 минут).\n\
@@ -338,8 +361,18 @@ impl App {
                  фокус возвращается; менеджер ждёт, пока ты перестанешь печатать.\n\
                  Это автоматизация ввода: правила Roblox и отдельных игр могут её не \
                  одобрять. Включено — на свой риск. Работает не с клиентом, запущенным \
-                 от администратора.",
-            )
+                 от администратора."
+            } else {
+                "Раз в несколько минут отправляет в каждое окно Sober нажатие F15 — ключ, \
+                 который ни одна игра не использует, — чтобы за простой не выкидывало \
+                 (Roblox кикает примерно через 20 минут).\n\
+                 Под Wayland ввод доходит только до активного окна, поэтому менеджер на \
+                 долю секунды выводит каждое окно вперёд и возвращает прежний фокус. \
+                 Нажатие идёт с виртуальной клавиатуры uinput, для игры оно неотличимо \
+                 от настоящей.\n\
+                 Это автоматизация ввода: правила Roblox и отдельных игр могут её не \
+                 одобрять. Включено — на свой риск."
+            })
             .changed();
 
         ui.add_enabled_ui(self.config.anti_afk, |ui| {
@@ -369,6 +402,7 @@ impl App {
                 }
             });
 
+            #[cfg(windows)]
             ui.horizontal_wrapped(|ui| {
                 ui.label("Режим:");
                 for mode in antiafk::Mode::variants() {
@@ -381,6 +415,12 @@ impl App {
                     }
                 }
             });
+            #[cfg(not(windows))]
+            ui.label("Режим: окно на миг выходит вперёд, затем фокус возвращается")
+                .on_hover_text(
+                    "Под Wayland ввод доходит только до активного окна, поэтому \
+                     «тихого» режима без фокуса здесь нет.",
+                );
         });
 
         if changed {
@@ -410,10 +450,29 @@ impl App {
             }
         });
 
+        #[cfg(not(windows))]
+        ui.label(RichText::new(crate::sober::status()).weak())
+            .on_hover_text(
+                "Профили Sober лежат в $XDG_DATA_HOME/RbxAccountManager/sober: у каждого \
+                 аккаунта свой HOME, поэтому аккаунты не мешают друг другу.",
+            );
+
         let mut start = self.autostart_enabled;
+        let (start_label, start_hint) = if cfg!(windows) {
+            (
+                "Запускать вместе с Windows",
+                "Запись в HKCU\\...\\Run: права администратора не нужны.",
+            )
+        } else {
+            (
+                "Запускать вместе с системой",
+                "Файл ~/.config/autostart/RbxAccountManager.desktop: его читает \
+                 любой рабочий стол Linux.",
+            )
+        };
         if ui
-            .checkbox(&mut start, "Запускать вместе с Windows")
-            .on_hover_text("Запись в HKCU\\...\\Run: права администратора не нужны.")
+            .checkbox(&mut start, start_label)
+            .on_hover_text(start_hint)
             .changed()
         {
             match autostart::set_enabled(start) {

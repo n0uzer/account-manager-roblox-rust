@@ -1,9 +1,10 @@
 name: Release
 
-# Publishes a GitHub release with a Windows x64 build.
+# Publishes a GitHub release with Windows x64 and Linux x86-64 builds.
 #
 #   1. bump `version` in Cargo.toml (and Cargo.lock: `cargo build` updates it);
-#   2. commit, then push a tag that matches it:  git tag v0.5.0 && git push origin v0.5.0
+#   2. commit, then push a tag that matches it:
+#      git tag v0.7.0 && git push origin v0.7.0
 #
 # The run can also be started by hand from the Actions tab with a tag name; the
 # tag is then created on the commit the run was started from.
@@ -14,7 +15,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.5.0 (must match the version in Cargo.toml)"
+        description: "Release tag, for example v0.7.0 (must match the version in Cargo.toml)"
         required: true
         type: string
 
@@ -26,33 +27,56 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: windows-latest
-    env:
-      # Passed through the environment, never pasted into a script: a tag name
-      # is user input. The normalized name is RELEASE_TAG, set by the first step.
-      INPUT_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Check the tag against Cargo.toml
-        shell: pwsh
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          # "0.6.0" typed into a manual run is taken as "v0.6.0".
-          $tag = $env:INPUT_TAG.Trim()
-          if ($tag -match '^\d') { $tag = "v$tag" }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
-            throw "Tag '$tag' is not like v1.2.3 or v1.2.3-rc.1"
-          }
-          $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
-            Select-Object -First 1
-          $version = $line.Matches[0].Groups[1].Value
-          if ($tag -ne "v$version") {
-            throw "Tag '$tag' does not match version $version in Cargo.toml"
-          }
-          Write-Host "Releasing $tag"
-          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # "0.7.0" typed into a manual run is taken as "v0.7.0".
+          tag="$(printf '%s' "$INPUT_TAG" | tr -d '[:space:]')"
+          case "$tag" in
+            [0-9]*) tag="v$tag" ;;
+          esac
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Tag '$tag' is not like v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::Tag '$tag' does not match version $version in Cargo.toml"
+            exit 1
+          fi
+          echo "Releasing $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: windows
+          - os: ubuntu-22.04
+            artifact: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev libegl1-mesa-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -63,7 +87,8 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
 
-      - name: Checksum
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -75,23 +100,52 @@ jobs:
             "$hash  rbm.exe`n")
           Get-Content dist/rbm.exe.sha256
 
-      - name: Publish
-        shell: pwsh
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
         run: |
-          $assets = @('dist/rbm.exe', 'dist/rbm.exe.sha256')
+          mkdir -p dist
+          cp target/release/rbm dist/rbm
+          tar -C dist -czf dist/rbm-linux-x86_64.tar.gz rbm
+          # `sha256sum -c` works from the directory with the archive.
+          (cd dist && sha256sum rbm-linux-x86_64.tar.gz > rbm-linux-x86_64.tar.gz.sha256)
+          cat dist/rbm-linux-x86_64.tar.gz.sha256
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        run: |
+          ls -l dist
           # A re-run for the same tag replaces the files instead of failing.
-          gh release view $env:RELEASE_TAG *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:RELEASE_TAG @assets --clobber
-          } else {
-            $flags = @()
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            flags=()
             # v1.2.3-rc.1 and the like are not offered as the latest release.
-            if ($env:RELEASE_TAG.Contains('-')) { $flags += '--prerelease' }
-            gh release create $env:RELEASE_TAG @assets `
-              --title $env:RELEASE_TAG `
-              --generate-notes `
-              --target $env:GITHUB_SHA `
-              @flags
-          }
-          if ($LASTEXITCODE -ne 0) { throw "gh failed with exit code $LASTEXITCODE" }
+            case "$RELEASE_TAG" in
+              *-*) flags+=(--prerelease) ;;
+            esac
+            gh release create "$RELEASE_TAG" dist/* \
+              --title "$RELEASE_TAG" \
+              --generate-notes \
+              --target "$GITHUB_SHA" \
+              "${flags[@]}"
+          fi

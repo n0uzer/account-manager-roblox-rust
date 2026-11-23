@@ -136,12 +136,17 @@ fn run(job: Job) -> Done {
             multi,
             limits,
             in_batch,
-        } => Done::Launched {
-            id,
-            label,
-            in_batch,
-            result: roblox::launch_game(place, &cookie, multi, limits),
-        },
+        } => {
+            // The id names the Sober profile on Linux, so it has to survive the
+            // move into the result.
+            let result = roblox::launch_game(&id, place, &cookie, multi, limits);
+            Done::Launched {
+                id,
+                label,
+                in_batch,
+                result,
+            }
+        }
         Job::Avatar { user_id } => Done::Avatar {
             user_id,
             result: avatar::load(user_id),

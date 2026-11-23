@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
 use crate::window;
 
 pub const MIN_MINUTES: u32 = 1;
@@ -53,6 +54,7 @@ pub enum Mode {
 }
 
 impl Mode {
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn label(self) -> &'static str {
         match self {
             Mode::Focus => "надёжный: окно на миг выходит вперёд",
@@ -60,6 +62,7 @@ impl Mode {
         }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn variants() -> [Mode; 2] {
         [Mode::Focus, Mode::Quiet]
     }
@@ -106,12 +109,30 @@ impl Report {
             self.reached, self.windows
         );
         if self.not_focused > 0 {
-            text.push_str(&format!(
-                "; не вышли вперёд: {} (клиент запущен от администратора?)",
-                self.not_focused
-            ));
+            text.push_str(&format!("; не вышли вперёд: {}", self.not_focused));
+            #[cfg(windows)]
+            text.push_str(" (клиент запущен от администратора?)");
         }
         text
+    }
+}
+
+/// Whether anti-AFK can work on this platform right now.
+///
+/// Windows has `SendInput`. On Linux the window must be focused (Wayland has no
+/// other way) and the tap must come from `uinput`; both halves are required.
+pub fn supported() -> bool {
+    #[cfg(windows)]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::kwin::available() && crate::uinput::available()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
     }
 }
 
@@ -190,14 +211,29 @@ fn start_worker() {
 /// Send one round of input to every client window and remember what happened.
 /// Blocks for a fraction of a second per window in `Mode::Focus`.
 pub fn pulse(mode: Mode) -> Report {
-    let handles = window::game_window_handles();
-    let (reached, not_focused) = match mode {
-        Mode::Quiet => (handles.iter().filter(|hwnd| win::nudge(**hwnd)).count(), 0),
-        Mode::Focus => win::focus_pulse(&handles),
+    #[cfg(windows)]
+    let (windows, reached, not_focused) = {
+        let handles = window::game_window_handles();
+        match mode {
+            Mode::Quiet => (
+                handles.len(),
+                handles.iter().filter(|hwnd| win::nudge(**hwnd)).count(),
+                0,
+            ),
+            Mode::Focus => {
+                let (reached, not_focused) = win::focus_pulse(&handles);
+                (handles.len(), reached, not_focused)
+            }
+        }
     };
+    // Wayland has no quiet mode: input only reaches the focused window, and the
+    // focus is what the pulse borrows for a moment.
+    #[cfg(not(windows))]
+    let (windows, reached, not_focused) = win::focus_pulse(&[]);
+
     let report = Report {
         mode,
-        windows: handles.len(),
+        windows,
         reached,
         not_focused,
     };
@@ -528,12 +564,47 @@ mod win {
 
 #[cfg(not(windows))]
 mod win {
-    pub(super) fn nudge(_handle: isize) -> bool {
-        false
-    }
+    /// One round over the Sober windows KWin knows about. Each window gets the
+    /// focus for a moment and a real F15 tap from the virtual keyboard; the
+    /// window that was in front is restored afterwards.
+    ///
+    /// Returns (windows, reached, not focused).
+    pub(super) fn focus_pulse(_handles: &[isize]) -> (usize, usize, usize) {
+        #[cfg(target_os = "linux")]
+        {
+            use std::time::Duration;
 
-    pub(super) fn focus_pulse(_handles: &[isize]) -> (usize, usize) {
-        (0, 0)
+            let windows = crate::kwin::windows();
+            if windows.is_empty() {
+                return (0, 0, 0);
+            }
+            let previous = crate::kwin::active_window();
+            let mut reached = 0;
+            let mut not_focused = 0;
+
+            for window in &windows {
+                if crate::kwin::focus(window) {
+                    // The compositor needs a moment to route the keyboard, and
+                    // the game a moment to read the event.
+                    std::thread::sleep(Duration::from_millis(350));
+                    if crate::uinput::tap_f15() {
+                        reached += 1;
+                    }
+                    std::thread::sleep(Duration::from_millis(150));
+                } else {
+                    not_focused += 1;
+                }
+            }
+
+            if let Some(previous) = previous {
+                crate::kwin::focus(&previous);
+            }
+            (windows.len(), reached, not_focused)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            (0, 0, 0)
+        }
     }
 }
 
@@ -582,6 +653,13 @@ mod tests {
 
     #[test]
     fn a_pulse_without_clients_reaches_nobody() {
+        // The Linux pulse asks KWin for windows instead of taking a handle
+        // list, so a real client running next to the tests would get the
+        // input. Do not touch it: this test is about the empty case.
+        if !crate::processes::client_procs().is_empty() {
+            eprintln!("skipping: a live client is running");
+            return;
+        }
         for mode in Mode::variants() {
             let report = pulse(mode);
             assert_eq!((report.windows, report.reached), (0, 0));
