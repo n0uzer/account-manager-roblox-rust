@@ -38,6 +38,7 @@ pub fn foreground_pid() -> Option<u32> {
 /// Linux cgroup v2 path of the instance `pid` belongs to, without the
 /// `/sys/fs/cgroup` prefix: `/user.slice/.../app-flatpak-org.vinegarhq.Sober-…`.
 /// `None` on Windows and for a process that has already gone.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn cgroup_path(pid: u32) -> Option<String> {
     win::cgroup_path(pid)
 }
@@ -225,6 +226,7 @@ mod win {
         (pid != 0).then_some(pid)
     }
 
+    #[cfg_attr(windows, allow(dead_code))]
     pub(super) fn cgroup_path(_pid: u32) -> Option<String> {
         None
     }

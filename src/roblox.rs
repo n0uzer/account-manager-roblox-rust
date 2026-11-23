@@ -33,6 +33,7 @@ pub enum LaunchKind {
     /// Direct `RobloxPlayerBeta.exe --app`: always spawns a new window.
     NewWindow,
     /// Sober with the account's own `HOME`: a separate instance every time.
+    #[cfg_attr(windows, allow(dead_code))]
     Sober,
 }
 

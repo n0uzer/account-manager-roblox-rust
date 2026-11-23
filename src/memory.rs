@@ -104,6 +104,7 @@ pub fn trim_background() -> usize {
 /// An eighth of the footprint is enough to matter for six clients and small
 /// enough not to empty a game that is about to be used; the clamp keeps a tiny
 /// client from a useless wakeup and a huge one from a multi-second stall.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn reclaim_budget(current: u64) -> Option<u64> {
     if current < RECLAIM_FLOOR {
         return None;
@@ -196,6 +197,7 @@ mod tests {
 
     #[test]
     #[ignore = "reclaims memory from live Sober instances"]
+    #[cfg(target_os = "linux")]
     fn smoke_reclaim() {
         println!("active: {:?}", crate::kwin::active_window());
         let instances: Vec<(u32, Option<String>)> = processes::client_pids()
